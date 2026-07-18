@@ -45,7 +45,9 @@ enum {
 
 _Static_assert(NINEFAN_MAX_FANS <= 10, "Single-digit SMC fan keys are required");
 
+#ifndef NINEFAN_SMC_READ_ONLY
 static void short_sleep(long nanoseconds);
+#endif
 
 static uint32_t fourcc(const char key[4]) {
     return ((uint32_t)(uint8_t)key[0] << 24) | ((uint32_t)(uint8_t)key[1] << 16)
@@ -116,6 +118,7 @@ static int read_raw_with_info(
     return 0;
 }
 
+#ifndef NINEFAN_SMC_READ_ONLY
 static int write_raw(
     ninefan_smc *smc, const char name[4], const uint8_t *bytes, size_t byte_count) {
     smc_key_data input = {0}, output = {0};
@@ -132,6 +135,7 @@ static int write_raw(
     memcpy(input.bytes, bytes, byte_count);
     return smc_call(smc, &input, &output, "SMC write");
 }
+#endif
 
 static int read_number(ninefan_smc *smc, const char name[4], float *value) {
     uint8_t bytes[32] = {0};
@@ -167,6 +171,7 @@ static int read_u8(ninefan_smc *smc, const char name[4], uint8_t *value) {
     return 0;
 }
 
+#ifndef NINEFAN_SMC_READ_ONLY
 static int write_u8(ninefan_smc *smc, const char name[4], uint8_t value) {
     const uint8_t bytes[1] = {value};
     return write_raw(smc, name, bytes, sizeof(bytes));
@@ -186,6 +191,7 @@ static int write_number(ninefan_smc *smc, const char name[4], float value) {
     }
     return write_raw(smc, name, bytes, info.size);
 }
+#endif
 
 static void fan_key(char output[5], const char suffix[3], int fan_index) {
     output[0] = 'F';
@@ -409,7 +415,8 @@ int ninefan_smc_hottest_temperature(
         }
     }
     if (!isfinite(hottest)) {
-        snprintf(smc->error, sizeof(smc->error), "No valid CPU/GPU temperature is available");
+        snprintf(smc->error, sizeof(smc->error),
+            "No valid safety temperature is available");
         return -1;
     }
     *temperature_c = hottest;
@@ -490,6 +497,7 @@ int ninefan_smc_validation_fingerprint(
     return count == 16 ? 0 : -1;
 }
 
+#ifndef NINEFAN_SMC_READ_ONLY
 static void short_sleep(long nanoseconds) {
     struct timespec duration = {.tv_sec = 0, .tv_nsec = nanoseconds};
     while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {
@@ -675,3 +683,4 @@ int ninefan_smc_restore_default(ninefan_smc *smc) {
     if (failed) memcpy(smc->error, first_error, sizeof(smc->error));
     return failed ? -1 : 0;
 }
+#endif

@@ -1,4 +1,5 @@
 #include "smc_codec.h"
+#include "lease.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -17,6 +18,8 @@
 
 #define GUARD_HEARTBEAT_BYTE 'H'
 #define GUARD_CLEAN_BYTE 'C'
+#define GUARD_ARM_BYTE 'A'
+#define GUARD_MAXIMUM_BYTE 'M'
 #define GUARD_READY_BYTE 'R'
 #define GUARD_TIMEOUT_MS 6000
 #define GUARD_RESTORE_ATTEMPTS 120
@@ -328,25 +331,76 @@ static int parse_fd(const char *text) {
         : -1;
 }
 
-static int monitor_parent(int read_fd) {
+static int parse_duration_ms(const char *text, uint64_t *value_out) {
+    if (!text || !text[0] || !value_out) return -1;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long value = strtoull(text, &end, 10);
+    if (errno != 0
+        || !end
+        || *end != '\0'
+        || value == 0
+        || value > NINEFAN_CURVE_LEASE_MAX_MS) {
+        return -1;
+    }
+    *value_out = (uint64_t)value;
+    return 0;
+}
+
+static int monitor_parent(int read_fd, ninefan_lease *lease) {
+    uint64_t last_heartbeat_ns = ninefan_continuous_time_ns();
+    int armed = 0;
+    if (last_heartbeat_ns == 0) return 1;
     for (;;) {
+        const uint64_t before_poll_ns = ninefan_continuous_time_ns();
+        if (ninefan_lease_check(
+                lease, before_poll_ns, NINEFAN_SUSPEND_GAP_MS)
+                != NINEFAN_LEASE_OK
+            || before_poll_ns < last_heartbeat_ns
+            || before_poll_ns - last_heartbeat_ns
+                >= (uint64_t)GUARD_TIMEOUT_MS * 1000000ULL) {
+            return 1;
+        }
         struct pollfd descriptor = {
             .fd = read_fd,
             .events = POLLIN | POLLHUP,
             .revents = 0,
         };
-        const int poll_result =
-            poll(&descriptor, 1, GUARD_TIMEOUT_MS);
+        const int poll_result = poll(&descriptor, 1, 1000);
         if (poll_result < 0 && errno == EINTR) continue;
-        if (poll_result <= 0) return 1;
+        if (poll_result < 0) return 1;
+
+        const uint64_t after_poll_ns = ninefan_continuous_time_ns();
+        if (ninefan_lease_check(
+                lease, after_poll_ns, NINEFAN_SUSPEND_GAP_MS)
+                != NINEFAN_LEASE_OK
+            || after_poll_ns < last_heartbeat_ns
+            || after_poll_ns - last_heartbeat_ns
+                >= (uint64_t)GUARD_TIMEOUT_MS * 1000000ULL) {
+            return 1;
+        }
+        if (poll_result == 0) continue;
 
         char bytes[64];
         const ssize_t count = read(read_fd, bytes, sizeof(bytes));
         if (count <= 0) return 1;
         for (ssize_t index = 0; index < count; index++) {
-            if (bytes[index] == GUARD_CLEAN_BYTE) return 0;
-            if (bytes[index] != GUARD_HEARTBEAT_BYTE) return 1;
+            if (bytes[index] == GUARD_CLEAN_BYTE) return armed;
+            if (bytes[index] == GUARD_ARM_BYTE) {
+                armed = 1;
+                continue;
+            }
+            if (bytes[index] == GUARD_MAXIMUM_BYTE) {
+                if (ninefan_lease_shorten(
+                        lease, NINEFAN_MAX_CURVE_LEASE_MAX_MS,
+                        after_poll_ns) != 0) {
+                    return 1;
+                }
+            } else if (bytes[index] != GUARD_HEARTBEAT_BYTE) {
+                return 1;
+            }
         }
+        last_heartbeat_ns = after_poll_ns;
     }
 }
 
@@ -364,24 +418,33 @@ static int restore_with_retries(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 7
+    if (argc != 9
         || strcmp(argv[1], "--watch-fd") != 0
         || strcmp(argv[3], "--ready-fd") != 0
         || strcmp(argv[5], "--protocol") != 0
-        || strcmp(argv[6], "1") != 0
+        || strcmp(argv[6], "2") != 0
+        || strcmp(argv[7], "--lease-ms") != 0
         || geteuid() != 0) {
         return 2;
     }
     const int read_fd = parse_fd(argv[2]);
     const int ready_fd = parse_fd(argv[4]);
+    uint64_t duration_ms = 0;
     struct stat read_metadata = {0}, ready_metadata = {0};
     if (read_fd < 0
         || ready_fd < 0
         || read_fd == ready_fd
+        || parse_duration_ms(argv[8], &duration_ms) != 0
         || fstat(read_fd, &read_metadata) != 0
         || fstat(ready_fd, &ready_metadata) != 0
         || !S_ISFIFO(read_metadata.st_mode)
         || !S_ISFIFO(ready_metadata.st_mode)) {
+        return 2;
+    }
+    ninefan_lease lease;
+    if (ninefan_lease_start(
+            &lease, duration_ms, NINEFAN_CURVE_LEASE_MAX_MS,
+            ninefan_continuous_time_ns()) != 0) {
         return 2;
     }
 
@@ -400,7 +463,7 @@ int main(int argc, char **argv) {
     }
     close(ready_fd);
 
-    const int restore_required = monitor_parent(read_fd);
+    const int restore_required = monitor_parent(read_fd, &lease);
     close(read_fd);
     if (!restore_required) return 0;
 
