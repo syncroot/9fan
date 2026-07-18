@@ -1,7 +1,7 @@
 # 9fan
 
 `9fan` is a tiny, dependency-free terminal fan controller for Apple Silicon
-Macs. Version 1.2 was built and hardware-validated on one Mac17,9 M5 Pro
+Macs. Version 1.3.1 was built and hardware-validated on one Mac17,9 M5 Pro
 MacBook Pro. It probes the hardware at runtime instead of assuming fixed RPM
 values or fan-mode key casing.
 
@@ -20,13 +20,21 @@ The app is conservative by design:
 - Temperature rise is applied immediately; release is damped to prevent hunting.
 - A missing or unreadable temperature sensor immediately surrenders to Apple's
   controller.
-- A 95 C hotspot immediately surrenders to Apple instead of keeping a manual
+- A 90 C hotspot immediately surrenders to Apple instead of keeping a manual
   ceiling.
+- Apple's supported
+  [`ProcessInfo.thermalState`](https://developer.apple.com/documentation/foundation/processinfo/thermalstate-swift.property)
+  is checked before control and every 200 ms while active. Serious, critical,
+  or unknown state surrenders to Apple.
 - A fan telemetry failure immediately surrenders control to Apple.
+- Active control continuously checks target ownership and physical fan
+  response. An unexplained target change or repeated under-response surrenders
+  to Apple.
 - Normal exit and common termination signals restore Apple control.
-- A small watchdog uses an independent minimal SMC connection and retries
-  restoration if the UI process crashes, is killed, or stops sending
-  heartbeats. Long legacy mode transitions emit progress heartbeats too.
+- A separately installed `9fan-guard` executable has its own minimal SMC
+  recovery implementation. It restores after six missed seconds and retries
+  for at least 60 seconds if the controller crashes, is killed, or stops
+  sending heartbeats. Long legacy transitions emit progress heartbeats too.
 - A root-owned lock prevents two privileged controllers from fighting.
 - Starting a curve refuses pre-existing manual fan mode, which protects upgrades
   from competing with an older controller that does not use the lock.
@@ -34,7 +42,7 @@ The app is conservative by design:
   controller; a mode override during active 9fan control stops reassertion and
   surrenders to Apple.
 - Hardware validation and complete temperature discovery are rechecked after
-  the watchdog reconnects to AppleSMC and before a curve is armed.
+  the guard starts and before a curve is armed.
 
 ## Curves
 
@@ -56,7 +64,7 @@ manual minimum is rejected rather than written as a target.
 
 The reported maximum is a conservative manual ceiling, not the fan's physical
 limit. Apple may command higher emergency cooling, so the Maximum preset is not
-an emergency mode and 9fan hands control back to Apple at 95 C or on sensor
+an emergency mode and 9fan hands control back to Apple at 90 C or on sensor
 loss.
 
 These are bounded presets, not Apple-approved thermal specifications. Their
@@ -68,8 +76,9 @@ allowed.
 
 On 2026-07-18, the guarded self-test passed on one Mac17,9 Apple M5 Pro running
 macOS 26.5.2 (build 25F84). Both fans accepted their SMC-reported 7,826 RPM
-maximum target, accelerated to 6,895 and 6,801 RPM, and returned to Apple
-automatic mode with a zero target after the test.
+maximum target, sustained 7,336 and 7,331 RPM under the stricter response test,
+and returned to Apple automatic mode with a zero target after the test. The
+validated SMC schema fingerprint was `651d1eadd3e88f2a`.
 
 This result documents one hardware and OS combination; it is not an
 Apple endorsement or a guarantee for another Mac. `9fan` still requires every
@@ -87,16 +96,18 @@ make analyze
 sudo make install
 ```
 
-The default install path is `/usr/local/bin/9fan`. Installation with `sudo`
-makes the executable root-owned so an unprivileged process cannot replace it
-before a later privileged launch. The install refuses symlinked intermediate
+The default install paths are `/usr/local/bin/9fan` and
+`/usr/local/bin/9fan-guard`. Installation with `sudo` makes both executables
+root-owned so an unprivileged process cannot replace them before a later
+privileged launch. Control refuses to start if the separate guard or its
+directory is not safely root-owned. The install refuses symlinked intermediate
 or final path components and requires existing directories to already be
 root-owned mode `0755`; it does not silently change ownership of shared
 directories. Confirm the complete path:
 
 ```sh
 ls -ld /usr/local /usr/local/bin
-ls -l /usr/local/bin/9fan
+ls -l /usr/local/bin/9fan /usr/local/bin/9fan-guard
 ```
 
 Do not run a copy from `build/`, `~/.local/bin`, or another user-writable
@@ -147,17 +158,20 @@ sudo /usr/local/bin/9fan self-test --yes
 ```
 
 The self-test refuses to run when the hotspot is unavailable or above 80 C,
-fan telemetry or temperature discovery is incomplete, or another controller
-already has a fan outside Apple-controlled mode. It repeats those checks after
-the watchdog reconnects and before its first write. Runtime target writes are
-also read back together with manual mode and must be accepted before control
-continues.
+Apple reports an unsafe thermal state, fan telemetry or temperature discovery
+is incomplete, or another controller already has a fan outside
+Apple-controlled mode. It repeats those checks after the guard starts and
+before its first write. Each fan must remain above 50% of its usable RPM span
+for three consecutive samples. Runtime target writes are read back, and active
+curves continue checking physical response after an eight-second spin-up
+allowance.
 
 A passing test writes `/var/db/9fan.validation` as a root-owned `0600` file.
-The record contains only the 9fan version, Mac model identifier, macOS build,
-fan count, and detected mode-key variant. A custom curve refuses to start if
-that record is missing or stale, so an app update, OS update, or hardware change
-requires the guarded test again.
+The record contains only the 9fan version, Mac model and chip identifiers,
+macOS build, fan count, detected mode-key variant, and a fingerprint of tested
+fan limits and SMC key schemas. A custom curve refuses to start if that record
+is missing or stale, so an app update, OS update, sensor/key change, or hardware
+change requires the guarded test again.
 
 At any time, force restoration of macOS control with:
 
@@ -170,16 +184,20 @@ temperature discovery or complete fan telemetry. Restoration never writes a
 zero target; after verified Apple-controlled mode (`0` auto or `3` system),
 macOS alone chooses whether 0 RPM is appropriate.
 
-Do not use `killall -9 9fan`: it can kill the independent watchdog along with
-the controller. See [SAFETY.md](SAFETY.md) for failure and recovery procedures.
+`killall -9 9fan` now targets the controller but not the separately named
+`9fan-guard`; the guard treats the closed heartbeat pipe as a crash and
+restores Apple control. Never kill `9fan-guard` while a curve is active. See
+[SAFETY.md](SAFETY.md) for failure and recovery procedures.
 
 ## Efficiency
 
-`9fan` is a single native C binary. It has no package dependencies, config
-daemon, analytics, or network access. A small watchdog child exists only while
-a custom curve is active. SMC sensors are discovered once and sampled every
-two seconds; fan targets are rewritten only when the requested speed changes
-materially.
+`9fan` installs two small native binaries: the controller and its independent
+recovery guard. It has no package dependencies, config daemon, analytics, or
+network access. A tiny Objective-C bridge reads Apple's supported thermal-state
+property; all fan control remains native C. The guard exists only while a
+custom curve or self-test is active. SMC sensors are discovered once and
+sampled every two seconds; fan targets are rewritten only when the requested
+speed changes materially.
 
 ## Private API and safety notice
 

@@ -21,18 +21,26 @@ without overwriting that controller, while a mode change during active 9fan
 control is treated as an Apple override and is not reasserted.
 
 Custom curves require the root-owned validation marker created by a passing
-self-test. The marker is tied to the app version, Mac model, macOS build, fan
-count, and mode-key variant, so relevant changes require a new test.
+self-test. The marker is tied to the app version, Mac model and chip, macOS
+build, fan count, mode-key variant, fan limits, and SMC sensor/key schema, so
+relevant changes require a new test.
 
 The SMC-reported maximum is not necessarily the physical maximum. A custom
-curve exits and restores Apple control if temperature telemetry is lost or the
-hotspot reaches 95 C, allowing macOS to use its full emergency cooling policy.
+curve exits and restores Apple control if temperature telemetry is lost, the
+hotspot reaches 90 C, or Apple's system thermal state becomes serious, critical,
+or unknown, allowing macOS to use its full emergency cooling policy.
+
+After an eight-second spin-up allowance, active control continuously verifies
+that each fan physically follows a conservative fraction of its requested
+target. Three consecutive under-response samples or an unexplained target
+change causes Apple handoff.
 
 ## Recovery
 
 Normal exit, `q`, Ctrl-C, SIGTERM, SIGHUP, and SIGQUIT restore Apple control.
-The independent watchdog retries restoration if the controller process dies
-or stops sending heartbeats for 15 seconds.
+The separately installed `9fan-guard` executable has an independent minimal SMC
+restore implementation. It begins recovery if the controller dies or stops
+sending heartbeats for six seconds and retries for at least 60 seconds.
 The recovery path does not depend on temperature discovery or complete normal
 telemetry, and it never writes a zero target.
 
@@ -41,8 +49,8 @@ Long legacy mode transitions continue sending watchdog heartbeats; a failed
 interactive request to restore Apple control terminates with an error instead
 of continuing without watchdog coverage.
 
-If the display is unresponsive, do not use `killall -9 9fan`, because that can
-kill both the controller and its watchdog. From another terminal, run:
+If the display is unresponsive, run the explicit recovery command from another
+terminal:
 
 ```sh
 sudo /usr/local/bin/9fan default
@@ -50,6 +58,10 @@ sudo /usr/local/bin/9fan default
 
 If another controller is still running, stop that controller normally; it may
 otherwise select manual mode again on its next sample.
+
+`killall -9 9fan` does not match the separately named `9fan-guard`, so the guard
+can recover from a forcibly killed controller. Never kill `9fan-guard` while a
+curve is active.
 
 After a kernel panic, power interruption, or forced termination of both
 processes, run the same recovery command after login. If status still reports

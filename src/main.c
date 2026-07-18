@@ -1,9 +1,14 @@
 #include "curve.h"
 #include "controller.h"
+#include "response_monitor.h"
+#include "signal_guard.h"
 #include "smc.h"
+#include "thermal_guard.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
@@ -19,14 +24,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NINEFAN_VERSION "1.2.0"
+#define NINEFAN_VERSION "1.3.1"
 #define SAMPLE_INTERVAL_MS 2000
 #define WATCHDOG_HEARTBEAT_INTERVAL_MS 2000
-#define WATCHDOG_TIMEOUT_MS 15000
 #define WATCHDOG_HEARTBEAT_BYTE 'H'
 #define WATCHDOG_CLEAN_BYTE 'C'
-#define APPLE_HANDOFF_TEMPERATURE_C 95.0f
+#define WATCHDOG_READY_BYTE 'R'
+#define WATCHDOG_READY_TIMEOUT_MS 2000
+#define APPLE_HANDOFF_TEMPERATURE_C 90.0f
 #define HARDWARE_VALIDATION_PATH "/var/db/9fan.validation"
+#define HARDWARE_VALIDATION_RECORD_SIZE 512
 
 static volatile sig_atomic_t termination_requested;
 
@@ -71,29 +78,59 @@ static void fatal_signal(int signal_number) {
     _exit(128 + signal_number);
 }
 
-static void install_signal_handlers(void) {
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_handler = request_termination;
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
-    sigaction(SIGHUP, &action, NULL);
-    sigaction(SIGQUIT, &action, NULL);
-
-    action.sa_handler = fatal_signal;
-    sigaction(SIGABRT, &action, NULL);
-    sigaction(SIGBUS, &action, NULL);
-    sigaction(SIGFPE, &action, NULL);
-    sigaction(SIGILL, &action, NULL);
-    sigaction(SIGSEGV, &action, NULL);
-    signal(SIGPIPE, SIG_IGN);
-}
-
 static long long monotonic_milliseconds(void) {
     struct timespec now = {0};
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+}
+
+static int trusted_guard_path(
+    char output[PATH_MAX], char *message, size_t message_size) {
+    char executable[PATH_MAX] = {0};
+    uint32_t executable_size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &executable_size) != 0) {
+        snprintf(message, message_size, "Could not locate the 9fan executable");
+        return -1;
+    }
+
+    char resolved[PATH_MAX] = {0};
+    if (!realpath(executable, resolved)) {
+        snprintf(message, message_size,
+            "Could not resolve the 9fan executable: %s", strerror(errno));
+        return -1;
+    }
+    char *separator = strrchr(resolved, '/');
+    if (!separator || separator == resolved) {
+        snprintf(message, message_size, "9fan has no trusted executable directory");
+        return -1;
+    }
+    *separator = '\0';
+
+    struct stat directory = {0};
+    if (lstat(resolved, &directory) != 0
+        || !S_ISDIR(directory.st_mode)
+        || directory.st_uid != 0
+        || (directory.st_mode & 0777) != 0755) {
+        snprintf(message, message_size,
+            "9fan executable directory is not safely root-owned");
+        return -1;
+    }
+
+    const int count =
+        snprintf(output, PATH_MAX, "%s/9fan-guard", resolved);
+    struct stat guard = {0};
+    if (count <= 0
+        || count >= PATH_MAX
+        || lstat(output, &guard) != 0
+        || !S_ISREG(guard.st_mode)
+        || guard.st_uid != 0
+        || guard.st_nlink != 1
+        || (guard.st_mode & 07777) != 0755) {
+        snprintf(message, message_size,
+            "9fan-guard is missing or is not a safe root-owned executable");
+        return -1;
+    }
+    return 0;
 }
 
 static void terminal_enter(ninefan_terminal *terminal) {
@@ -161,20 +198,29 @@ static void read_sysctl_string(const char *name, char *output, size_t output_siz
 }
 
 static int hardware_validation_record(
-    const ninefan_smc *smc, char *output, size_t output_size) {
+    ninefan_smc *smc, char *output, size_t output_size) {
     if (!smc || !output || output_size == 0) return -1;
-    char model[64], os_build[64];
+    char model[64], chip[64], os_build[64], fingerprint[17];
     read_sysctl_string("hw.model", model, sizeof(model));
+    read_sysctl_string("machdep.cpu.brand_string", chip, sizeof(chip));
     read_sysctl_string("kern.osversion", os_build, sizeof(os_build));
-    if (!model[0] || !os_build[0]) return -1;
+    if (!model[0]
+        || !chip[0]
+        || !os_build[0]
+        || ninefan_smc_validation_fingerprint(
+               smc, fingerprint, sizeof(fingerprint)) != 0) {
+        return -1;
+    }
     const int count = snprintf(output, output_size,
-        "format=1\nversion=%s\nmodel=%s\nos=%s\nfans=%d\nmode=%s\n",
-        NINEFAN_VERSION, model, os_build, smc->fan_count, smc->mode_key_format);
+        "format=2\nversion=%s\nmodel=%s\nchip=%s\nos=%s\n"
+        "fans=%d\nmode=%s\nschema=%s\n",
+        NINEFAN_VERSION, model, chip, os_build,
+        smc->fan_count, smc->mode_key_format, fingerprint);
     return count > 0 && (size_t)count < output_size ? count : -1;
 }
 
-static int hardware_validation_matches(const ninefan_smc *smc) {
-    char expected[384];
+static int hardware_validation_matches(ninefan_smc *smc) {
+    char expected[HARDWARE_VALIDATION_RECORD_SIZE];
     const int expected_size =
         hardware_validation_record(smc, expected, sizeof(expected));
     if (expected_size <= 0) return 0;
@@ -206,13 +252,13 @@ static int hardware_validation_matches(const ninefan_smc *smc) {
         && memcmp(actual, expected, (size_t)expected_size) == 0;
 }
 
-static int write_hardware_validation(const ninefan_smc *smc) {
-    char record[384];
+static int write_hardware_validation(ninefan_smc *smc) {
+    char record[HARDWARE_VALIDATION_RECORD_SIZE];
     const int record_size =
         hardware_validation_record(smc, record, sizeof(record));
     if (record_size <= 0) return -1;
     const int fd = open(HARDWARE_VALIDATION_PATH,
-        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
     struct stat metadata = {0};
     int result = 0;
@@ -309,22 +355,30 @@ static int refresh_snapshot(
 }
 
 static int restore_controller(
-    ninefan_smc *smc, ninefan_controller *controller, char *message, size_t message_size) {
+    ninefan_smc *smc,
+    ninefan_controller *controller,
+    ninefan_response_monitor *response_monitor,
+    char *message,
+    size_t message_size) {
     const int result = ninefan_smc_restore_default(smc);
     if (result != 0) {
         snprintf(message, message_size, "Default restore failed: %s", ninefan_smc_error(smc));
         return -1;
     }
     ninefan_controller_reset_runtime(controller);
+    ninefan_response_monitor_init(response_monitor);
     snprintf(message, message_size, "Apple automatic control restored");
     return 0;
 }
 
 static void restore_after_control_failure(
-    ninefan_smc *smc, ninefan_controller *controller,
+    ninefan_smc *smc,
+    ninefan_controller *controller,
+    ninefan_response_monitor *response_monitor,
     char *message, size_t message_size) {
     if (ninefan_smc_restore_default(smc) == 0) {
         controller->manual_active = 0;
+        ninefan_response_monitor_init(response_monitor);
         return;
     }
     const size_t used = strnlen(message, message_size);
@@ -335,7 +389,10 @@ static void restore_after_control_failure(
 }
 
 static int update_controller(
-    ninefan_smc *smc, ninefan_controller *controller, ninefan_watchdog *watchdog,
+    ninefan_smc *smc,
+    ninefan_controller *controller,
+    ninefan_response_monitor *response_monitor,
+    ninefan_watchdog *watchdog,
     char *message, size_t message_size) {
     if (!controller->curve) return 0;
 
@@ -344,7 +401,7 @@ static int update_controller(
             snprintf(message, message_size,
                 "Fan %d telemetry is invalid; surrendering to Apple control", index);
             restore_after_control_failure(
-                smc, controller, message, message_size);
+                smc, controller, response_monitor, message, message_size);
             return -1;
         }
         if (!controller->manual_active && smc->fans[index].mode == 1) {
@@ -359,7 +416,7 @@ static int update_controller(
                 "Fan %d left 9fan manual mode; surrendering to Apple control",
                 index);
             restore_after_control_failure(
-                smc, controller, message, message_size);
+                smc, controller, response_monitor, message, message_size);
             return -1;
         }
     }
@@ -367,7 +424,10 @@ static int update_controller(
     const int needs_manual = ninefan_controller_compute(controller);
 
     if (!needs_manual) {
-        if (controller->manual_active) return restore_controller(smc, controller, message, message_size);
+        if (controller->manual_active) {
+            return restore_controller(
+                smc, controller, response_monitor, message, message_size);
+        }
         return 0;
     }
 
@@ -376,7 +436,7 @@ static int update_controller(
             snprintf(message, message_size,
                 "Safety watchdog stopped; restoring Apple control");
             restore_after_control_failure(
-                smc, controller, message, message_size);
+                smc, controller, response_monitor, message, message_size);
             return -1;
         }
         const ninefan_fan *fan = &smc->fans[index];
@@ -387,7 +447,7 @@ static int update_controller(
             snprintf(message, message_size,
                 "Fan %d target calculation failed; restoring Apple control", index);
             restore_after_control_failure(
-                smc, controller, message, message_size);
+                smc, controller, response_monitor, message, message_size);
             return -1;
         }
         const int enabled_now = !controller->manual_active;
@@ -398,7 +458,7 @@ static int update_controller(
             snprintf(message, message_size, "Fan %d manual mode failed: %s",
                 index, ninefan_smc_error(smc));
             restore_after_control_failure(
-                smc, controller, message, message_size);
+                smc, controller, response_monitor, message, message_size);
             return -1;
         }
         if (enabled_now || !controller->manual_active
@@ -407,7 +467,17 @@ static int update_controller(
                 snprintf(message, message_size, "Fan %d target failed: %s",
                     index, ninefan_smc_error(smc));
                 restore_after_control_failure(
-                    smc, controller, message, message_size);
+                    smc, controller, response_monitor, message, message_size);
+                return -1;
+            }
+            if (ninefan_response_monitor_note_target(
+                    response_monitor, index, target,
+                    monotonic_milliseconds()) != 0) {
+                snprintf(message, message_size,
+                    "Fan %d response monitor could not arm; restoring Apple control",
+                    index);
+                restore_after_control_failure(
+                    smc, controller, response_monitor, message, message_size);
                 return -1;
             }
         }
@@ -415,7 +485,7 @@ static int update_controller(
             snprintf(message, message_size,
                 "Safety watchdog stopped; restoring Apple control");
             restore_after_control_failure(
-                smc, controller, message, message_size);
+                smc, controller, response_monitor, message, message_size);
             return -1;
         }
     }
@@ -423,54 +493,49 @@ static int update_controller(
     return 0;
 }
 
-static void watchdog_child(int read_fd, int control_lock_fd) {
-    active_terminal = NULL;
-    if (control_lock_fd >= 0) close(control_lock_fd);
-    setpgid(0, 0);
-    signal(SIGINT, SIG_IGN);
-    signal(SIGTERM, SIG_IGN);
-    signal(SIGHUP, SIG_IGN);
-    signal(SIGQUIT, SIG_IGN);
-
-    int restore_required = 0;
-    for (;;) {
-        struct pollfd descriptor = {
-            .fd = read_fd,
-            .events = POLLIN | POLLHUP,
-            .revents = 0,
-        };
-        const int poll_result = poll(&descriptor, 1, WATCHDOG_TIMEOUT_MS);
-        if (poll_result < 0 && errno == EINTR) continue;
-        if (poll_result <= 0) {
-            restore_required = 1;
-            break;
+static int verify_fan_response(
+    ninefan_smc *smc,
+    ninefan_controller *controller,
+    ninefan_response_monitor *response_monitor,
+    char *message,
+    size_t message_size) {
+    if (!controller->manual_active) return 0;
+    const long long now = monotonic_milliseconds();
+    for (int index = 0; index < smc->fan_count; index++) {
+        const ninefan_fan *fan = &smc->fans[index];
+        float required_rpm = NAN;
+        const ninefan_response_result result =
+            ninefan_response_monitor_observe(
+                response_monitor,
+                index,
+                fan->minimum_rpm,
+                fan->actual_rpm,
+                fan->target_rpm,
+                now,
+                &required_rpm);
+        if (result == NINEFAN_RESPONSE_OK
+            || result == NINEFAN_RESPONSE_GRACE) {
+            continue;
         }
-        char bytes[64];
-        const ssize_t count = read(read_fd, bytes, sizeof(bytes));
-        if (count <= 0) {
-            restore_required = 1;
-            break;
+        if (result == NINEFAN_RESPONSE_TARGET_CHANGED) {
+            snprintf(message, message_size,
+                "Fan %d target changed outside 9fan; surrendering to Apple control",
+                index);
+        } else if (result == NINEFAN_RESPONSE_STALLED) {
+            snprintf(message, message_size,
+                "Fan %d stayed below %.0f RPM while target was %.0f; "
+                "surrendering to Apple control",
+                index, required_rpm, fan->target_rpm);
+        } else {
+            snprintf(message, message_size,
+                "Fan %d response could not be verified; surrendering to Apple control",
+                index);
         }
-        int clean_shutdown = 0;
-        for (ssize_t index = 0; index < count; index++) {
-            if (bytes[index] == WATCHDOG_CLEAN_BYTE) clean_shutdown = 1;
-        }
-        if (clean_shutdown) break;
+        restore_after_control_failure(
+            smc, controller, response_monitor, message, message_size);
+        return -1;
     }
-    close(read_fd);
-    if (restore_required) {
-        for (int attempt = 0; attempt < 5; attempt++) {
-            ninefan_smc smc;
-            if (ninefan_smc_open_recovery(&smc) == 0) {
-                const int restored = ninefan_smc_restore_default(&smc);
-                ninefan_smc_close(&smc);
-                if (restored == 0) break;
-            }
-            struct timespec delay = {.tv_sec = 0, .tv_nsec = 250000000L};
-            while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
-        }
-    }
-    _exit(0);
+    return 0;
 }
 
 static int watchdog_heartbeat(ninefan_watchdog *watchdog, int force) {
@@ -498,22 +563,34 @@ static int watchdog_start(
     char *message, size_t message_size) {
     if (watchdog->active) return 0;
 
-    /*
-     * Reopen the parent's AppleSMC connection after fork. The child therefore
-     * owns no inherited IOKit connection and can open a clean one if needed.
-     */
+    char guard_path[PATH_MAX] = {0};
+    if (trusted_guard_path(guard_path, message, message_size) != 0) {
+        return -1;
+    }
+
+    /* The guard starts without inheriting the parent's IOKit connection. */
     ninefan_smc_close(smc);
-    int descriptors[2];
-    if (pipe(descriptors) != 0) {
+    int heartbeat_descriptors[2] = {-1, -1};
+    int ready_descriptors[2] = {-1, -1};
+    if (pipe(heartbeat_descriptors) != 0
+        || pipe(ready_descriptors) != 0) {
+        if (heartbeat_descriptors[0] >= 0) close(heartbeat_descriptors[0]);
+        if (heartbeat_descriptors[1] >= 0) close(heartbeat_descriptors[1]);
+        if (ready_descriptors[0] >= 0) close(ready_descriptors[0]);
+        if (ready_descriptors[1] >= 0) close(ready_descriptors[1]);
         snprintf(message, message_size, "Could not create safety watchdog: %s", strerror(errno));
         (void)ninefan_smc_open(smc);
         return -1;
     }
-    if (fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0
-        || fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) != 0
-        || fcntl(descriptors[1], F_SETFL, O_NONBLOCK) != 0) {
-        close(descriptors[0]);
-        close(descriptors[1]);
+    if (fcntl(heartbeat_descriptors[0], F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(heartbeat_descriptors[1], F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(heartbeat_descriptors[1], F_SETFL, O_NONBLOCK) != 0
+        || fcntl(ready_descriptors[0], F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(ready_descriptors[1], F_SETFD, FD_CLOEXEC) != 0) {
+        close(heartbeat_descriptors[0]);
+        close(heartbeat_descriptors[1]);
+        close(ready_descriptors[0]);
+        close(ready_descriptors[1]);
         snprintf(message, message_size,
             "Could not configure safety watchdog: %s", strerror(errno));
         (void)ninefan_smc_open(smc);
@@ -521,20 +598,62 @@ static int watchdog_start(
     }
     const pid_t pid = fork();
     if (pid < 0) {
-        close(descriptors[0]);
-        close(descriptors[1]);
+        close(heartbeat_descriptors[0]);
+        close(heartbeat_descriptors[1]);
+        close(ready_descriptors[0]);
+        close(ready_descriptors[1]);
         snprintf(message, message_size, "Could not start safety watchdog: %s", strerror(errno));
         (void)ninefan_smc_open(smc);
         return -1;
     }
     if (pid == 0) {
-        close(descriptors[1]);
-        watchdog_child(descriptors[0], control_lock_fd);
+        active_terminal = NULL;
+        close(heartbeat_descriptors[1]);
+        close(ready_descriptors[0]);
+        if (control_lock_fd >= 0) close(control_lock_fd);
+        if (fcntl(heartbeat_descriptors[0], F_SETFD, 0) != 0
+            || fcntl(ready_descriptors[1], F_SETFD, 0) != 0) {
+            _exit(127);
+        }
+        char heartbeat_fd[24], ready_fd[24];
+        snprintf(heartbeat_fd, sizeof(heartbeat_fd), "%d", heartbeat_descriptors[0]);
+        snprintf(ready_fd, sizeof(ready_fd), "%d", ready_descriptors[1]);
+        execl(guard_path, guard_path,
+            "--watch-fd", heartbeat_fd,
+            "--ready-fd", ready_fd,
+            "--protocol", "1",
+            (char *)NULL);
+        _exit(127);
     }
 
-    close(descriptors[0]);
+    close(heartbeat_descriptors[0]);
+    close(ready_descriptors[1]);
+
+    struct pollfd ready_poll = {
+        .fd = ready_descriptors[0],
+        .events = POLLIN | POLLHUP,
+        .revents = 0,
+    };
+    int poll_result;
+    do {
+        poll_result =
+            poll(&ready_poll, 1, WATCHDOG_READY_TIMEOUT_MS);
+    } while (poll_result < 0 && errno == EINTR);
+    char ready = '\0';
+    const ssize_t ready_count =
+        poll_result > 0 ? read(ready_descriptors[0], &ready, 1) : -1;
+    close(ready_descriptors[0]);
+    if (ready_count != 1 || ready != WATCHDOG_READY_BYTE) {
+        close(heartbeat_descriptors[1]);
+        wait_for_watchdog(pid);
+        snprintf(message, message_size,
+            "Independent safety guard did not become ready");
+        (void)ninefan_smc_open(smc);
+        return -1;
+    }
+
     watchdog->active = 1;
-    watchdog->write_fd = descriptors[1];
+    watchdog->write_fd = heartbeat_descriptors[1];
     watchdog->pid = pid;
     if (ninefan_smc_open(smc) != 0) {
         snprintf(message, message_size, "AppleSMC reopen failed: %s", ninefan_smc_error(smc));
@@ -584,6 +703,13 @@ static void render_ui(
     printf("\033[H\033[2J");
     printf("\033[30;46;1m 9fan %-8s  %-18s  %-20s \033[0m\r\n",
         NINEFAN_VERSION, model, chip);
+    const ninefan_thermal_state thermal_state =
+        ninefan_thermal_state_current();
+    printf("\r\n  System    thermal state %-8s",
+        ninefan_thermal_state_name(thermal_state));
+    if (!ninefan_thermal_state_allows_control(thermal_state)) {
+        printf("  \033[31;1mAPPLE HANDOFF\033[0m");
+    }
     if (controller->temperature_valid) {
         printf("\r\n  Hotspot   \033[1m%5.1f C\033[0m  (%s, hottest CPU/GPU/memory sensor)\r\n",
             controller->current_temperature, controller->hottest_key);
@@ -614,7 +740,8 @@ static void render_ui(
             ninefan_curves[index].summary);
     }
     printf("\r\n  [q] Restore Apple default and quit\r\n");
-    printf("  Safety: sensor loss or 95C -> Apple; exit/UI crash -> Apple default\r\n");
+    printf("  Safety: serious thermal state, sensor loss, or 90C -> Apple\r\n");
+    printf("          exit/UI crash -> independent Apple-control guard\r\n");
     if (!privileged) {
         printf("\r\n  \033[33;1mRead-only. Install root-owned, then run sudo /usr/local/bin/9fan.\033[0m\r\n");
     }
@@ -649,6 +776,14 @@ static int select_curve(
     if (!privileged) {
         snprintf(message, message_size,
             "Curve selection requires root; use sudo /usr/local/bin/9fan");
+        return -1;
+    }
+    const ninefan_thermal_state thermal_state =
+        ninefan_thermal_state_current();
+    if (!ninefan_thermal_state_allows_control(thermal_state)) {
+        snprintf(message, message_size,
+            "System thermal state is %s; custom control is refused",
+            ninefan_thermal_state_name(thermal_state));
         return -1;
     }
     if (smc->temperature_keys_saturated) {
@@ -692,7 +827,10 @@ static int select_curve(
 }
 
 static int select_default(
-    ninefan_controller *controller, ninefan_watchdog *watchdog, ninefan_smc *smc,
+    ninefan_controller *controller,
+    ninefan_response_monitor *response_monitor,
+    ninefan_watchdog *watchdog,
+    ninefan_smc *smc,
     char *message, size_t message_size, int privileged) {
     if (!privileged) {
         snprintf(message, message_size,
@@ -700,7 +838,8 @@ static int select_default(
         return -1;
     }
     controller->curve = NULL;
-    const int result = restore_controller(smc, controller, message, message_size);
+    const int result = restore_controller(
+        smc, controller, response_monitor, message, message_size);
     if (result == 0) watchdog_clean_stop(watchdog);
     else watchdog_trigger_restore(watchdog);
     return result;
@@ -712,7 +851,9 @@ static int run_ui(
     ninefan_terminal terminal;
     ninefan_watchdog watchdog = {0};
     ninefan_controller controller;
+    ninefan_response_monitor response_monitor;
     ninefan_controller_init(&controller);
+    ninefan_response_monitor_init(&response_monitor);
     char message[256] = {0};
     const int interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
 
@@ -733,6 +874,24 @@ static int run_ui(
     int exit_code = 0;
 
     while (!termination_requested) {
+        if (controller.curve) {
+            const ninefan_thermal_state thermal_state =
+                ninefan_thermal_state_current();
+            if (!ninefan_thermal_state_allows_control(thermal_state)) {
+                snprintf(message, sizeof(message),
+                    "System thermal state became %s; surrendering to Apple control",
+                    ninefan_thermal_state_name(thermal_state));
+                controller.curve = NULL;
+                if (ninefan_smc_restore_default(smc) == 0) {
+                    ninefan_response_monitor_init(&response_monitor);
+                    watchdog_clean_stop(&watchdog);
+                } else {
+                    watchdog_trigger_restore(&watchdog);
+                }
+                exit_code = 1;
+                break;
+            }
+        }
         if (watchdog_heartbeat(&watchdog, 0) != 0) {
             snprintf(message, sizeof(message),
                 "Safety watchdog stopped; restoring Apple control");
@@ -747,6 +906,15 @@ static int run_ui(
             const int snapshot_result =
                 refresh_snapshot(smc, &controller, message, sizeof(message));
             if (controller.curve) {
+                if (snapshot_result == 0
+                    && verify_fan_response(
+                           smc, &controller, &response_monitor,
+                           message, sizeof(message)) != 0) {
+                    controller.curve = NULL;
+                    watchdog_trigger_restore(&watchdog);
+                    exit_code = 1;
+                    break;
+                }
                 const int emergency_temperature =
                     controller.temperature_valid
                     && controller.current_temperature
@@ -759,6 +927,7 @@ static int run_ui(
                     }
                     controller.curve = NULL;
                     if (ninefan_smc_restore_default(smc) == 0) {
+                        ninefan_response_monitor_init(&response_monitor);
                         watchdog_clean_stop(&watchdog);
                     } else {
                         watchdog_trigger_restore(&watchdog);
@@ -767,7 +936,8 @@ static int run_ui(
                     break;
                 }
                 const int update_result = update_controller(
-                    smc, &controller, &watchdog, message, sizeof(message));
+                    smc, &controller, &response_monitor, &watchdog,
+                    message, sizeof(message));
                 if (update_result != 0) {
                     controller.curve = NULL;
                     if (update_result == -2) {
@@ -787,7 +957,18 @@ static int run_ui(
                     exit_code = 1;
                     break;
                 }
-                (void)ninefan_smc_refresh_fans(smc);
+                if (ninefan_smc_refresh_fans(smc) != 0) {
+                    snprintf(message, sizeof(message),
+                        "Fan telemetry refresh failed after target update; "
+                        "surrendering to Apple control");
+                    restore_after_control_failure(
+                        smc, &controller, &response_monitor,
+                        message, sizeof(message));
+                    controller.curve = NULL;
+                    watchdog_trigger_restore(&watchdog);
+                    exit_code = 1;
+                    break;
+                }
             }
             if (interactive) render_ui(smc, &controller, message, privileged);
             else print_snapshot_line(smc, &controller);
@@ -805,7 +986,8 @@ static int run_ui(
             if (read(STDIN_FILENO, &key, 1) != 1) continue;
             if (key == 'q' || key == 3) break;
             if (key == 'a' || key == '0') {
-                if (select_default(&controller, &watchdog, smc,
+                if (select_default(
+                        &controller, &response_monitor, &watchdog, smc,
                         message, sizeof(message), privileged) != 0) {
                     exit_code = 1;
                     break;
@@ -860,6 +1042,19 @@ static int print_status(ninefan_smc *smc) {
         smc->temperature_keys_saturated
             ? "INCOMPLETE/SATURATED (unsafe to control)"
             : "complete");
+    char fingerprint[17] = {0};
+    const int fingerprint_valid =
+        ninefan_smc_validation_fingerprint(
+            smc, fingerprint, sizeof(fingerprint)) == 0;
+    printf("Schema:      %s\n",
+        fingerprint_valid ? fingerprint : "unavailable");
+    const ninefan_thermal_state thermal_state =
+        ninefan_thermal_state_current();
+    printf("Thermal:     %s%s\n",
+        ninefan_thermal_state_name(thermal_state),
+        ninefan_thermal_state_allows_control(thermal_state)
+            ? ""
+            : " (Apple handoff required)");
     if (controller.temperature_valid) {
         printf("Hotspot:     %.1f C (%s)\n", controller.current_temperature, controller.hottest_key);
     } else {
@@ -874,7 +1069,7 @@ static int print_status(ninefan_smc *smc) {
             fan->maximum_rpm, mode_name(fan->mode), fan->mode);
     }
     if (message[0]) fprintf(stderr, "9fan: %s\n", message);
-    return controller.temperature_valid && fans_valid
+    return controller.temperature_valid && fans_valid && fingerprint_valid
         && !smc->temperature_keys_saturated ? 0 : 1;
 }
 
@@ -900,6 +1095,15 @@ static int run_self_test(
         if (!isatty(STDIN_FILENO)) {
             fprintf(stderr, "9fan: use 'self-test --yes' for an intentional non-interactive run\n");
         }
+        return 1;
+    }
+
+    const ninefan_thermal_state initial_thermal_state =
+        ninefan_thermal_state_current();
+    if (!ninefan_thermal_state_allows_control(initial_thermal_state)) {
+        fprintf(stderr,
+            "9fan: self-test refused because system thermal state is %s\n",
+            ninefan_thermal_state_name(initial_thermal_state));
         return 1;
     }
 
@@ -943,7 +1147,10 @@ static int run_self_test(
     }
     hotspot = NAN;
     memcpy(hotspot_key, "----", 5);
-    if (ninefan_smc_hottest_temperature(smc, &hotspot, hotspot_key) != 0
+    const ninefan_thermal_state rechecked_thermal_state =
+        ninefan_thermal_state_current();
+    if (!ninefan_thermal_state_allows_control(rechecked_thermal_state)
+        || ninefan_smc_hottest_temperature(smc, &hotspot, hotspot_key) != 0
         || !isfinite(hotspot) || hotspot > 80.0f
         || smc->temperature_keys_saturated
         || ninefan_smc_refresh_fans(smc) != 0) {
@@ -998,6 +1205,7 @@ static int run_self_test(
     }
 
     int fans_responded[NINEFAN_MAX_FANS] = {0};
+    unsigned int response_streak[NINEFAN_MAX_FANS] = {0};
     if (result == 0) {
         for (int attempt = 0; attempt < 40 && !termination_requested; attempt++) {
             if (ninefan_smc_refresh_fans(smc) != 0) {
@@ -1010,9 +1218,13 @@ static int run_self_test(
             for (int index = 0; index < smc->fan_count; index++) {
                 const ninefan_fan *fan = &smc->fans[index];
                 const float response_floor = fan->minimum_rpm
-                    + 0.10f * (fan->maximum_rpm - fan->minimum_rpm);
-                fans_responded[index] =
-                    fan->valid && fan->actual_rpm >= response_floor;
+                    + 0.50f * (fan->maximum_rpm - fan->minimum_rpm);
+                if (fan->valid && fan->actual_rpm >= response_floor) {
+                    response_streak[index]++;
+                } else {
+                    response_streak[index] = 0;
+                }
+                fans_responded[index] = response_streak[index] >= 3;
                 if (!fans_responded[index]) all_responded = 0;
             }
             if (all_responded) break;
@@ -1054,7 +1266,11 @@ static int run_self_test(
 }
 
 int main(int argc, char **argv) {
-    install_signal_handlers();
+    if (ninefan_signal_guard_install(
+            request_termination, fatal_signal) != 0) {
+        fprintf(stderr, "9fan: could not install safety signal handlers\n");
+        return 1;
+    }
     atexit(emergency_terminal_restore);
 
     if (argc > 3) {

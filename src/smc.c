@@ -417,6 +417,79 @@ int ninefan_smc_hottest_temperature(
     return 0;
 }
 
+static void fingerprint_bytes(
+    uint64_t *hash, const void *bytes, size_t byte_count) {
+    const uint8_t *cursor = bytes;
+    for (size_t index = 0; index < byte_count; index++) {
+        *hash ^= cursor[index];
+        *hash *= UINT64_C(1099511628211);
+    }
+}
+
+static int fingerprint_key_schema(
+    ninefan_smc *smc, const char key[5], uint64_t *hash) {
+    smc_key_info info = {0};
+    if (key_info(smc, fourcc(key), &info) != 0) return -1;
+    fingerprint_bytes(hash, key, 4);
+    fingerprint_bytes(hash, &info.size, sizeof(info.size));
+    fingerprint_bytes(hash, &info.type, sizeof(info.type));
+    fingerprint_bytes(hash, &info.attributes, sizeof(info.attributes));
+    return 0;
+}
+
+int ninefan_smc_validation_fingerprint(
+    ninefan_smc *smc, char *output, size_t output_size) {
+    if (!smc || !smc->is_open || !output || output_size < 17) return -1;
+    if (ninefan_smc_refresh_fans(smc) != 0) return -1;
+
+    uint64_t hash = UINT64_C(14695981039346656037);
+    static const char domain[] = "9fan-hardware-schema-v2";
+    fingerprint_bytes(&hash, domain, sizeof(domain));
+    fingerprint_bytes(&hash, &smc->fan_count, sizeof(smc->fan_count));
+    fingerprint_bytes(
+        &hash, smc->mode_key_format, sizeof(smc->mode_key_format));
+    fingerprint_bytes(
+        &hash, &smc->ftst_available, sizeof(smc->ftst_available));
+
+    for (int index = 0; index < smc->fan_count; index++) {
+        const ninefan_fan *fan = &smc->fans[index];
+        fingerprint_bytes(
+            &hash, &fan->minimum_rpm, sizeof(fan->minimum_rpm));
+        fingerprint_bytes(
+            &hash, &fan->maximum_rpm, sizeof(fan->maximum_rpm));
+        const char *suffixes[] = {
+            "Ac", "Tg", "Mn", "Mx", &smc->mode_key_format[3],
+        };
+        for (size_t suffix_index = 0;
+             suffix_index < sizeof(suffixes) / sizeof(suffixes[0]);
+             suffix_index++) {
+            char key[5];
+            fan_key(key, suffixes[suffix_index], index);
+            if (fingerprint_key_schema(smc, key, &hash) != 0) return -1;
+        }
+    }
+
+    fingerprint_bytes(
+        &hash, &smc->temperature_key_count,
+        sizeof(smc->temperature_key_count));
+    for (size_t index = 0; index < smc->temperature_key_count; index++) {
+        fingerprint_bytes(&hash, smc->temperature_keys[index], 4);
+        fingerprint_bytes(
+            &hash, &smc->temperature_sizes[index],
+            sizeof(smc->temperature_sizes[index]));
+        fingerprint_bytes(
+            &hash, &smc->temperature_types[index],
+            sizeof(smc->temperature_types[index]));
+        fingerprint_bytes(
+            &hash, &smc->temperature_attributes[index],
+            sizeof(smc->temperature_attributes[index]));
+    }
+
+    const int count = snprintf(
+        output, output_size, "%016llx", (unsigned long long)hash);
+    return count == 16 ? 0 : -1;
+}
+
 static void short_sleep(long nanoseconds) {
     struct timespec duration = {.tv_sec = 0, .tv_nsec = nanoseconds};
     while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {

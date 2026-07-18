@@ -45,6 +45,8 @@ const char *ninefan_smc_error(const ninefan_smc *smc);
 int ninefan_smc_refresh_fans(ninefan_smc *smc);
 int ninefan_smc_hottest_temperature(
     ninefan_smc *smc, float *temperature_c, char hottest_key[5]);
+int ninefan_smc_validation_fingerprint(
+    ninefan_smc *smc, char *output, size_t output_size);
 
 int ninefan_smc_enable_manual(
     ninefan_smc *smc, int fan_index,
