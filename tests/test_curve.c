@@ -26,6 +26,16 @@ int main(void) {
     assert(near(ninefan_curve_fraction(balanced, 100.0f), 1.0f));
     assert(near(ninefan_curve_fraction(NULL, 60.0f), 1.0f));
 
+    ninefan_curve invalid = *balanced;
+    invalid.release_hysteresis_c = NAN;
+    assert(!ninefan_curve_is_valid(&invalid));
+    invalid = *balanced;
+    invalid.points[0].temperature_c += 1.0f;
+    assert(!ninefan_curve_is_valid(&invalid));
+    invalid = *balanced;
+    invalid.points[3].fan_fraction = 0.9f;
+    assert(!ninefan_curve_is_valid(&invalid));
+
     puts("curve tests passed");
     return 0;
 }

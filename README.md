@@ -1,8 +1,9 @@
 # 9fan
 
 `9fan` is a tiny, dependency-free terminal fan controller for Apple Silicon
-Macs. It was built for the M5 Pro MacBook Pro and probes the hardware at
-runtime instead of assuming fixed RPM values or fan-mode key casing.
+Macs. Version 1.2 was built and read-only validated on an M5 Pro MacBook Pro.
+It probes the hardware at runtime instead of assuming fixed RPM values or
+fan-mode key casing.
 
 The app is conservative by design:
 
@@ -12,9 +13,23 @@ The app is conservative by design:
   preserving the Mac's true 0 RPM idle.
 - The hottest valid CPU, GPU, or memory sensor drives both fans.
 - Temperature rise is applied immediately; release is damped to prevent hunting.
-- A missing temperature sensor forces maximum RPM.
+- A missing or unreadable temperature sensor immediately surrenders to Apple's
+  controller.
+- A 95 C hotspot immediately surrenders to Apple instead of keeping a manual
+  ceiling.
+- A fan telemetry failure immediately surrenders control to Apple.
 - Normal exit and common termination signals restore Apple control.
-- A small watchdog restores Apple control if the UI process crashes or is killed.
+- A small watchdog uses an independent minimal SMC connection and retries
+  restoration if the UI process crashes, is killed, or stops sending
+  heartbeats. Long legacy mode transitions emit progress heartbeats too.
+- A root-owned lock prevents two privileged controllers from fighting.
+- Starting a curve refuses pre-existing manual fan mode, which protects upgrades
+  from competing with an older controller that does not use the lock.
+- A later external manual-mode change stops 9fan without overwriting that
+  controller; a mode override during active 9fan control stops reassertion and
+  surrenders to Apple.
+- Hardware validation and complete temperature discovery are rechecked after
+  the watchdog reconnects to AppleSMC and before a curve is armed.
 
 ## Curves
 
@@ -31,7 +46,18 @@ maximum, not a percentage of absolute RPM.
 
 The presets intentionally never request a manual RPM below the SMC minimum or
 above its reported maximum. This matters on M5, whose firmware behavior differs
-from earlier Apple Silicon generations.
+from earlier Apple Silicon generations. A zero or otherwise invalid reported
+manual minimum is rejected rather than written as a target.
+
+The reported maximum is a conservative manual ceiling, not the fan's physical
+limit. Apple may command higher emergency cooling, so the Maximum preset is not
+an emergency mode and 9fan hands control back to Apple at 95 C or on sensor
+loss.
+
+These are bounded presets, not Apple-approved thermal specifications. Their
+math and controller state transitions are tested, while hardware acceptance
+must be checked with the guarded self-test on each Mac before a custom curve is
+allowed.
 
 ## Build and install
 
@@ -40,21 +66,27 @@ Requirements: macOS, Apple Silicon, and Xcode Command Line Tools.
 ```sh
 make
 make test
-make install
+make analyze
+sudo make install
 ```
 
-The default install path is `~/.local/bin/9fan`. If that directory is in your
-`PATH`, launch the monitor with:
+The default install path is `/usr/local/bin/9fan`. Installation with `sudo`
+makes the executable root-owned so an unprivileged process cannot replace it
+before a later privileged launch. The install refuses symlinked intermediate
+or final path components and requires existing directories to already be
+root-owned mode `0755`; it does not silently change ownership of shared
+directories. Confirm the complete path:
 
 ```sh
-9fan
+ls -ld /usr/local /usr/local/bin
+ls -l /usr/local/bin/9fan
 ```
 
-Fan writes require root. `sudo` may use a restricted `PATH`, so this form works
-reliably:
+Do not run a copy from `build/`, `~/.local/bin`, or another user-writable
+directory with `sudo`. Fan writes require root:
 
 ```sh
-sudo "$(command -v 9fan)"
+sudo /usr/local/bin/9fan
 ```
 
 Keys in the interactive screen:
@@ -71,7 +103,7 @@ Keys in the interactive screen:
 You can also start directly on a curve:
 
 ```sh
-sudo "$(command -v 9fan)" balanced
+sudo /usr/local/bin/9fan balanced
 ```
 
 ## Verification and recovery
@@ -83,25 +115,54 @@ Read-only hardware discovery does not need sudo:
 ```
 
 To verify that this Mac accepts the M5 fan-control sequence, run the safe
-self-test. It requests only each fan's reported minimum, verifies that the SMC
-accepted manual mode and the target, then immediately restores Apple control:
+self-test. It only raises cooling: each fan is briefly sent to its reported
+maximum while 9fan verifies manual mode, target readback, and actual RPM
+response, then immediately restores Apple control:
 
 ```sh
-sudo "$(command -v 9fan)" self-test
+sudo /usr/local/bin/9fan self-test
 ```
+
+Scripts and non-TTY sessions must express intent explicitly:
+
+```sh
+sudo /usr/local/bin/9fan self-test --yes
+```
+
+The self-test refuses to run when the hotspot is unavailable or above 80 C,
+fan telemetry or temperature discovery is incomplete, or another controller
+already has a fan outside Apple-controlled mode. It repeats those checks after
+the watchdog reconnects and before its first write. Runtime target writes are
+also read back together with manual mode and must be accepted before control
+continues.
+
+A passing test writes `/var/db/9fan.validation` as a root-owned `0600` file.
+The record contains only the 9fan version, Mac model identifier, macOS build,
+fan count, and detected mode-key variant. A custom curve refuses to start if
+that record is missing or stale, so an app update, OS update, or hardware change
+requires the guarded test again.
 
 At any time, force restoration of macOS control with:
 
 ```sh
-sudo "$(command -v 9fan)" default
+sudo /usr/local/bin/9fan default
 ```
+
+Recovery uses only the minimal fan-mode keys, so it does not depend on normal
+temperature discovery or complete fan telemetry. Restoration never writes a
+zero target; after verified Apple-controlled mode (`0` auto or `3` system),
+macOS alone chooses whether 0 RPM is appropriate.
+
+Do not use `killall -9 9fan`: it can kill the independent watchdog along with
+the controller. See [SAFETY.md](SAFETY.md) for failure and recovery procedures.
 
 ## Efficiency
 
 `9fan` is a single native C binary. It has no package dependencies, config
-daemon, analytics, network access, or recurring subprocesses. SMC sensors are
-discovered once and sampled every two seconds; fan targets are rewritten only
-when the requested speed changes materially.
+daemon, analytics, or network access. A small watchdog child exists only while
+a custom curve is active. SMC sensors are discovered once and sampled every
+two seconds; fan targets are rewritten only when the requested speed changes
+materially.
 
 ## Private API and safety notice
 
@@ -117,4 +178,6 @@ That project documents successful M5 Max testing, including the lowercase
 `F%dmd` mode key and direct mode writes. `9fan` probes both lowercase and
 uppercase variants rather than hard-coding a generation.
 
-See [NOTICE](NOTICE) for attribution.
+See [NOTICE](NOTICE) and [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) for
+attribution and license text. This repository is source-only; no unsigned
+prebuilt release should be treated as trusted.

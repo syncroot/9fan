@@ -1,4 +1,5 @@
 #include "smc.h"
+#include "smc_codec.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
@@ -42,8 +43,9 @@ enum {
     SMC_READ_INFO = 9,
 };
 
-static const uint32_t SMC_FLOAT = 0x666c7420; /* "flt " */
-static const uint32_t SMC_FPE2 = 0x66706532;  /* "fpe2" */
+_Static_assert(NINEFAN_MAX_FANS <= 10, "Single-digit SMC fan keys are required");
+
+static void short_sleep(long nanoseconds);
 
 static uint32_t fourcc(const char key[4]) {
     return ((uint32_t)(uint8_t)key[0] << 24) | ((uint32_t)(uint8_t)key[1] << 16)
@@ -63,6 +65,11 @@ static int smc_call(
         smc->connection, SMC_SELECTOR, input, sizeof(*input), output, &output_size);
     if (result != KERN_SUCCESS) {
         set_error(smc, operation, result);
+        return -1;
+    }
+    if (output_size != sizeof(*output)) {
+        snprintf(smc->error, sizeof(smc->error),
+            "%s returned %zu bytes instead of %zu", operation, output_size, sizeof(*output));
         return -1;
     }
     if (output->result != 0) {
@@ -86,6 +93,11 @@ static int read_raw(
     smc_key_data input = {0}, output = {0};
     input.key = fourcc(name);
     if (key_info(smc, input.key, &input.info) != 0) return -1;
+    if (input.info.size == 0 || input.info.size > sizeof(output.bytes)) {
+        snprintf(smc->error, sizeof(smc->error),
+            "%.4s has invalid SMC read size %u", name, input.info.size);
+        return -1;
+    }
     input.command = SMC_READ_BYTES;
     if (smc_call(smc, &input, &output, "SMC read") != 0) return -1;
     memcpy(bytes, output.bytes, sizeof(output.bytes));
@@ -104,12 +116,20 @@ static int read_raw_with_info(
     return 0;
 }
 
-static int write_raw(ninefan_smc *smc, const char name[4], const uint8_t *bytes) {
+static int write_raw(
+    ninefan_smc *smc, const char name[4], const uint8_t *bytes, size_t byte_count) {
     smc_key_data input = {0}, output = {0};
     input.key = fourcc(name);
     if (key_info(smc, input.key, &input.info) != 0) return -1;
+    if (!bytes || input.info.size == 0 || input.info.size > sizeof(input.bytes)
+        || input.info.size != byte_count) {
+        snprintf(smc->error, sizeof(smc->error),
+            "%.4s has unexpected SMC write size %u (expected %zu)",
+            name, input.info.size, byte_count);
+        return -1;
+    }
     input.command = SMC_WRITE_BYTES;
-    memcpy(input.bytes, bytes, input.info.size > 32 ? 32 : input.info.size);
+    memcpy(input.bytes, bytes, byte_count);
     return smc_call(smc, &input, &output, "SMC write");
 }
 
@@ -117,15 +137,7 @@ static int read_number(ninefan_smc *smc, const char name[4], float *value) {
     uint8_t bytes[32] = {0};
     smc_key_info info = {0};
     if (read_raw(smc, name, bytes, &info) != 0) return -1;
-    if (info.size == 4 && info.type == SMC_FLOAT) {
-        memcpy(value, bytes, sizeof(*value));
-        return isfinite(*value) ? 0 : -1;
-    }
-    if (info.size == 2 && info.type == SMC_FPE2) {
-        const uint16_t raw = ((uint16_t)bytes[0] << 8) | bytes[1];
-        *value = (float)raw / 4.0f;
-        return 0;
-    }
+    if (ninefan_smc_decode_number(info.type, info.size, bytes, value) == 0) return 0;
     snprintf(smc->error, sizeof(smc->error), "%.4s has unsupported SMC format", name);
     return -1;
 }
@@ -139,17 +151,16 @@ static int read_cached_float(
     };
     uint8_t bytes[32] = {0};
     if (read_raw_with_info(smc, smc->temperature_keys[index], info, bytes) != 0) return -1;
-    if (info.size != 4 || info.type != SMC_FLOAT) return -1;
-    memcpy(value, bytes, sizeof(*value));
-    return isfinite(*value) ? 0 : -1;
+    return ninefan_smc_decode_number(info.type, info.size, bytes, value);
 }
 
 static int read_u8(ninefan_smc *smc, const char name[4], uint8_t *value) {
     uint8_t bytes[32] = {0};
     smc_key_info info = {0};
     if (read_raw(smc, name, bytes, &info) != 0) return -1;
-    if (info.size < 1) {
-        snprintf(smc->error, sizeof(smc->error), "%.4s is empty", name);
+    if (info.size != 1) {
+        snprintf(smc->error, sizeof(smc->error),
+            "%.4s has invalid uint8 size %u", name, info.size);
         return -1;
     }
     *value = bytes[0];
@@ -158,32 +169,38 @@ static int read_u8(ninefan_smc *smc, const char name[4], uint8_t *value) {
 
 static int write_u8(ninefan_smc *smc, const char name[4], uint8_t value) {
     const uint8_t bytes[1] = {value};
-    return write_raw(smc, name, bytes);
+    return write_raw(smc, name, bytes, sizeof(bytes));
 }
 
 static int write_number(ninefan_smc *smc, const char name[4], float value) {
+    if (!isfinite(value)) {
+        snprintf(smc->error, sizeof(smc->error), "%.4s received a non-finite value", name);
+        return -1;
+    }
     smc_key_info info = {0};
     if (key_info(smc, fourcc(name), &info) != 0) return -1;
     uint8_t bytes[32] = {0};
-    if (info.size == 4 && info.type == SMC_FLOAT) {
-        memcpy(bytes, &value, sizeof(value));
-    } else if (info.size == 2 && info.type == SMC_FPE2) {
-        const uint16_t raw = (uint16_t)lroundf(value * 4.0f);
-        bytes[0] = (uint8_t)(raw >> 8);
-        bytes[1] = (uint8_t)(raw & 0xff);
-    } else {
+    if (ninefan_smc_encode_number(info.type, info.size, value, bytes) != 0) {
         snprintf(smc->error, sizeof(smc->error), "%.4s has unsupported SMC format", name);
         return -1;
     }
-    return write_raw(smc, name, bytes);
+    return write_raw(smc, name, bytes, info.size);
 }
 
-static void fan_key(char output[5], const char *format, int fan_index) {
-    snprintf(output, 5, format, fan_index);
+static void fan_key(char output[5], const char suffix[3], int fan_index) {
+    output[0] = 'F';
+    output[1] = (char)('0' + fan_index);
+    output[2] = suffix[0];
+    output[3] = suffix[1];
+    output[4] = '\0';
 }
 
 static int is_temperature_key(const char key[5]) {
     if (key[0] != 'T') return 0;
+    for (size_t index = 2; index < 4; index++) {
+        const unsigned char byte = (unsigned char)key[index];
+        if (byte < 0x21 || byte > 0x7e) return 0;
+    }
     switch (key[1]) {
         case 'e':
         case 'f':
@@ -200,27 +217,42 @@ static int is_temperature_key(const char key[5]) {
 static void discover_temperature_keys(ninefan_smc *smc) {
     uint8_t count_bytes[32] = {0};
     smc_key_info count_info = {0};
-    if (read_raw(smc, "#KEY", count_bytes, &count_info) != 0 || count_info.size < 4) return;
+    if (read_raw(smc, "#KEY", count_bytes, &count_info) != 0 || count_info.size < 4) {
+        smc->temperature_keys_saturated = 1;
+        return;
+    }
     const uint32_t count = ((uint32_t)count_bytes[0] << 24)
                          | ((uint32_t)count_bytes[1] << 16)
                          | ((uint32_t)count_bytes[2] << 8)
                          | (uint32_t)count_bytes[3];
+    if (count == 0 || count > 100000) {
+        smc->temperature_keys_saturated = 1;
+        return;
+    }
 
-    for (uint32_t index = 0;
-         index < count && smc->temperature_key_count < NINEFAN_MAX_TEMP_KEYS;
-         index++) {
+    for (uint32_t index = 0; index < count; index++) {
         smc_key_data input = {0}, output = {0};
         input.command = SMC_READ_INDEX;
         input.data32 = index;
-        if (smc_call(smc, &input, &output, "SMC enumerate") != 0) continue;
+        if (smc_call(smc, &input, &output, "SMC enumerate") != 0) {
+            smc->temperature_keys_saturated = 1;
+            continue;
+        }
         char key[5] = {
             (char)(output.key >> 24), (char)(output.key >> 16),
             (char)(output.key >> 8), (char)output.key, '\0'
         };
         if (!is_temperature_key(key)) continue;
         smc_key_info info = {0};
-        if (key_info(smc, output.key, &info) != 0) continue;
-        if (info.size != 4 || info.type != SMC_FLOAT) continue;
+        if (key_info(smc, output.key, &info) != 0) {
+            smc->temperature_keys_saturated = 1;
+            continue;
+        }
+        if (info.size != 4 || info.type != NINEFAN_SMC_FLOAT) continue;
+        if (smc->temperature_key_count == NINEFAN_MAX_TEMP_KEYS) {
+            smc->temperature_keys_saturated = 1;
+            continue;
+        }
         const size_t stored_index = smc->temperature_key_count++;
         memcpy(smc->temperature_keys[stored_index], key, 5);
         smc->temperature_sizes[stored_index] = info.size;
@@ -229,7 +261,7 @@ static void discover_temperature_keys(ninefan_smc *smc) {
     }
 }
 
-int ninefan_smc_open(ninefan_smc *smc) {
+int ninefan_smc_open_recovery(ninefan_smc *smc) {
     if (!smc) return -1;
     memset(smc, 0, sizeof(*smc));
 
@@ -286,8 +318,21 @@ int ninefan_smc_open(ninefan_smc *smc) {
         return -1;
     }
     smc->ftst_available = read_u8(smc, "Ftst", &probe) == 0;
+    smc->error[0] = '\0';
+    return 0;
+}
+
+int ninefan_smc_open(ninefan_smc *smc) {
+    if (ninefan_smc_open_recovery(smc) != 0) return -1;
     discover_temperature_keys(smc);
-    return ninefan_smc_refresh_fans(smc);
+    if (ninefan_smc_refresh_fans(smc) != 0) {
+        char error[sizeof(smc->error)];
+        memcpy(error, smc->error, sizeof(error));
+        ninefan_smc_close(smc);
+        memcpy(smc->error, error, sizeof(smc->error));
+        return -1;
+    }
+    return 0;
 }
 
 void ninefan_smc_close(ninefan_smc *smc) {
@@ -303,22 +348,45 @@ const char *ninefan_smc_error(const ninefan_smc *smc) {
 
 int ninefan_smc_refresh_fans(ninefan_smc *smc) {
     if (!smc || !smc->is_open) return -1;
+    int failed = 0;
+    char first_error[sizeof(smc->error)] = {0};
     for (int index = 0; index < smc->fan_count; index++) {
         ninefan_fan *fan = &smc->fans[index];
-        fan->index = index;
+        fan->valid = 0;
+        ninefan_fan refreshed = {.index = index};
         char key[5];
-        fan_key(key, "F%dAc", index);
-        if (read_number(smc, key, &fan->actual_rpm) != 0) return -1;
-        fan_key(key, "F%dTg", index);
-        if (read_number(smc, key, &fan->target_rpm) != 0) return -1;
-        fan_key(key, "F%dMn", index);
-        if (read_number(smc, key, &fan->minimum_rpm) != 0) return -1;
-        fan_key(key, "F%dMx", index);
-        if (read_number(smc, key, &fan->maximum_rpm) != 0) return -1;
-        fan_key(key, smc->mode_key_format, index);
-        if (read_u8(smc, key, &fan->mode) != 0) return -1;
+        fan_key(key, "Ac", index);
+        if (read_number(smc, key, &refreshed.actual_rpm) != 0) goto fan_failed;
+        fan_key(key, "Tg", index);
+        if (read_number(smc, key, &refreshed.target_rpm) != 0) goto fan_failed;
+        fan_key(key, "Mn", index);
+        if (read_number(smc, key, &refreshed.minimum_rpm) != 0) goto fan_failed;
+        fan_key(key, "Mx", index);
+        if (read_number(smc, key, &refreshed.maximum_rpm) != 0) goto fan_failed;
+        fan_key(key, &smc->mode_key_format[3], index);
+        if (read_u8(smc, key, &refreshed.mode) != 0) goto fan_failed;
+        if (!isfinite(refreshed.actual_rpm) || !isfinite(refreshed.target_rpm)
+            || !isfinite(refreshed.minimum_rpm) || !isfinite(refreshed.maximum_rpm)
+            || refreshed.actual_rpm < 0.0f || refreshed.actual_rpm > 50000.0f
+            || refreshed.target_rpm < 0.0f || refreshed.target_rpm > 50000.0f
+            || refreshed.minimum_rpm <= 0.0f
+            || refreshed.maximum_rpm <= 0.0f
+            || refreshed.maximum_rpm > 20000.0f
+            || refreshed.maximum_rpm < refreshed.minimum_rpm) {
+            snprintf(smc->error, sizeof(smc->error),
+                "Fan %d returned invalid RPM limits or telemetry", index);
+            goto fan_failed;
+        }
+        refreshed.valid = 1;
+        *fan = refreshed;
+        continue;
+
+fan_failed:
+        if (!failed) memcpy(first_error, smc->error, sizeof(first_error));
+        failed = 1;
     }
-    return 0;
+    if (failed) memcpy(smc->error, first_error, sizeof(smc->error));
+    return failed ? -1 : 0;
 }
 
 int ninefan_smc_hottest_temperature(
@@ -328,8 +396,13 @@ int ninefan_smc_hottest_temperature(
     char key_for_hottest[5] = "----";
     for (size_t index = 0; index < smc->temperature_key_count; index++) {
         float candidate = NAN;
-        if (read_cached_float(smc, index, &candidate) != 0) continue;
-        if (!isfinite(candidate) || candidate < 5.0f || candidate > 115.0f) continue;
+        if (read_cached_float(smc, index, &candidate) != 0 || !isfinite(candidate)) {
+            snprintf(smc->error, sizeof(smc->error),
+                "Temperature sensor %.4s could not be read safely",
+                smc->temperature_keys[index]);
+            return -1;
+        }
+        if (candidate < 5.0f) continue;
         if (candidate > hottest) {
             hottest = candidate;
             memcpy(key_for_hottest, smc->temperature_keys[index], 5);
@@ -351,19 +424,66 @@ static void short_sleep(long nanoseconds) {
     }
 }
 
-int ninefan_smc_enable_manual(ninefan_smc *smc, int fan_index) {
+static int mode_is(ninefan_smc *smc, const char key[5], uint8_t expected) {
+    uint8_t mode = 0xff;
+    if (read_u8(smc, key, &mode) != 0) return 0;
+    if (mode == expected) return 1;
+    snprintf(smc->error, sizeof(smc->error),
+        "%.4s reported mode %u instead of %u", key, mode, expected);
+    return 0;
+}
+
+static int mode_is_system_controlled(ninefan_smc *smc, const char key[5]) {
+    uint8_t mode = 0xff;
+    if (read_u8(smc, key, &mode) != 0) return 0;
+    if (mode == 0 || mode == 3) return 1;
+    snprintf(smc->error, sizeof(smc->error),
+        "%.4s remained outside Apple-controlled mode (reported %u)", key, mode);
+    return 0;
+}
+
+int ninefan_smc_enable_manual(
+    ninefan_smc *smc, int fan_index,
+    const volatile sig_atomic_t *cancel_requested,
+    ninefan_smc_progress_callback progress,
+    void *progress_context) {
     if (!smc || fan_index < 0 || fan_index >= smc->fan_count) return -1;
     char mode_key[5];
-    fan_key(mode_key, smc->mode_key_format, fan_index);
-    uint8_t mode = 0;
-    if (read_u8(smc, mode_key, &mode) == 0 && mode == 1) return 0;
-    if (write_u8(smc, mode_key, 1) == 0) return 0;
-    if (!smc->ftst_available) return -1;
+    fan_key(mode_key, &smc->mode_key_format[3], fan_index);
+    if (mode_is(smc, mode_key, 1)) return 0;
+    if (write_u8(smc, mode_key, 1) == 0) {
+        short_sleep(50000000L);
+        if (mode_is(smc, mode_key, 1)) return 0;
+    }
+    if (!smc->ftst_available) {
+        snprintf(smc->error, sizeof(smc->error),
+            "Fan %d rejected direct manual mode and no Ftst fallback is available",
+            fan_index);
+        return -1;
+    }
 
     if (write_u8(smc, "Ftst", 1) != 0) return -1;
+    if (progress && progress(progress_context) != 0) {
+        snprintf(smc->error, sizeof(smc->error),
+            "Safety watchdog heartbeat failed during manual-mode transition");
+        return -1;
+    }
     short_sleep(500000000L);
-    for (int attempt = 0; attempt < 100; attempt++) {
-        if (write_u8(smc, mode_key, 1) == 0) return 0;
+    for (int attempt = 0; attempt < 60; attempt++) {
+        if (cancel_requested && *cancel_requested) {
+            snprintf(smc->error, sizeof(smc->error),
+                "Manual-mode transition cancelled for fan %d", fan_index);
+            return -1;
+        }
+        if (progress && progress(progress_context) != 0) {
+            snprintf(smc->error, sizeof(smc->error),
+                "Safety watchdog heartbeat failed during manual-mode transition");
+            return -1;
+        }
+        if (write_u8(smc, mode_key, 1) == 0) {
+            short_sleep(50000000L);
+            if (mode_is(smc, mode_key, 1)) return 0;
+        }
         short_sleep(100000000L);
     }
     snprintf(smc->error, sizeof(smc->error), "Timed out enabling manual mode for fan %d", fan_index);
@@ -373,10 +493,52 @@ int ninefan_smc_enable_manual(ninefan_smc *smc, int fan_index) {
 int ninefan_smc_set_target(ninefan_smc *smc, int fan_index, float rpm) {
     if (!smc || fan_index < 0 || fan_index >= smc->fan_count || !isfinite(rpm)) return -1;
     const ninefan_fan *fan = &smc->fans[fan_index];
+    if (!fan->valid
+        || !isfinite(fan->minimum_rpm) || !isfinite(fan->maximum_rpm)
+        || fan->minimum_rpm <= 0.0f
+        || fan->maximum_rpm <= 0.0f
+        || fan->maximum_rpm > 20000.0f
+        || fan->maximum_rpm < fan->minimum_rpm) {
+        snprintf(smc->error, sizeof(smc->error),
+            "Fan %d has unsafe RPM limits", fan_index);
+        return -1;
+    }
     const float bounded = fminf(fan->maximum_rpm, fmaxf(fan->minimum_rpm, rpm));
-    char key[5];
-    fan_key(key, "F%dTg", fan_index);
-    return write_number(smc, key, bounded);
+    if (!(bounded > 0.0f)) {
+        snprintf(smc->error, sizeof(smc->error),
+            "Fan %d manual target must be above zero RPM", fan_index);
+        return -1;
+    }
+    char mode_key[5], target_key[5];
+    fan_key(mode_key, &smc->mode_key_format[3], fan_index);
+    fan_key(target_key, "Tg", fan_index);
+    if (!mode_is(smc, mode_key, 1)) return -1;
+    if (write_number(smc, target_key, bounded) != 0) return -1;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        short_sleep(100000000L);
+        float accepted = NAN;
+        if (mode_is(smc, mode_key, 1)
+            && read_number(smc, target_key, &accepted) == 0
+            && fabsf(accepted - bounded) <= 25.0f) {
+            return 0;
+        }
+    }
+    snprintf(smc->error, sizeof(smc->error),
+        "Fan %d did not accept target %.0f RPM", fan_index, bounded);
+    return -1;
+}
+
+static void best_effort_maximum_target(ninefan_smc *smc, int fan_index) {
+    char maximum_key[5], target_key[5];
+    float maximum_rpm = NAN;
+    fan_key(maximum_key, "Mx", fan_index);
+    fan_key(target_key, "Tg", fan_index);
+    if (read_number(smc, maximum_key, &maximum_rpm) == 0
+        && isfinite(maximum_rpm)
+        && maximum_rpm > 0.0f
+        && maximum_rpm <= 20000.0f) {
+        (void)write_number(smc, target_key, maximum_rpm);
+    }
 }
 
 int ninefan_smc_restore_default(ninefan_smc *smc) {
@@ -385,24 +547,56 @@ int ninefan_smc_restore_default(ninefan_smc *smc) {
     char first_error[sizeof(smc->error)] = {0};
     for (int index = 0; index < smc->fan_count; index++) {
         char key[5];
-        fan_key(key, smc->mode_key_format, index);
-        if (write_u8(smc, key, 0) != 0 && !failed) {
+        fan_key(key, &smc->mode_key_format[3], index);
+        int automatic = 0;
+        for (int attempt = 0; attempt < 5 && !automatic; attempt++) {
+            if (write_u8(smc, key, 0) == 0) {
+                short_sleep(50000000L);
+                automatic = mode_is_system_controlled(smc, key);
+            }
+        }
+        if (!automatic && !failed) {
             failed = 1;
             memcpy(first_error, smc->error, sizeof(first_error));
         }
-        fan_key(key, "F%dTg", index);
-        /*
-         * Target reset is best effort: once mode 0 is accepted, M5 firmware may
-         * hand control to thermalmonitord before this second write arrives.
-         */
-        (void)write_number(smc, key, 0.0f);
+        if (!automatic) {
+            /*
+             * Never lower a target when automatic-mode restoration failed.
+             * Best-effort maximum cooling is safer than leaving an unknown
+             * manual target in place.
+             */
+            best_effort_maximum_target(smc, index);
+        }
     }
     if (smc->ftst_available) {
-        uint8_t ftst = 0;
-        if (read_u8(smc, "Ftst", &ftst) == 0 && ftst == 1
-            && write_u8(smc, "Ftst", 0) != 0 && !failed) {
+        uint8_t ftst = 0xff;
+        int clear_result = write_u8(smc, "Ftst", 0);
+        if (clear_result == 0) clear_result = read_u8(smc, "Ftst", &ftst);
+        if (clear_result == 0 && ftst != 0) {
+            snprintf(smc->error, sizeof(smc->error),
+                "Ftst did not return to its default state");
+            clear_result = -1;
+        }
+        if (clear_result != 0 && !failed) {
             failed = 1;
             memcpy(first_error, smc->error, sizeof(first_error));
+        }
+    }
+    /*
+     * Clearing Ftst or another controller could change mode after the first
+     * verification. Recheck at the end and choose maximum cooling on failure.
+     * We intentionally never write a zero target; Apple owns that decision in
+     * verified automatic mode.
+     */
+    for (int index = 0; index < smc->fan_count; index++) {
+        char mode_key[5];
+        fan_key(mode_key, &smc->mode_key_format[3], index);
+        if (!mode_is_system_controlled(smc, mode_key)) {
+            if (!failed) {
+                failed = 1;
+                memcpy(first_error, smc->error, sizeof(first_error));
+            }
+            best_effort_maximum_target(smc, index);
         }
     }
     if (failed) memcpy(smc->error, first_error, sizeof(smc->error));

@@ -86,17 +86,24 @@ float ninefan_curve_fraction(const ninefan_curve *curve, float temperature_c) {
 }
 
 int ninefan_curve_is_valid(const ninefan_curve *curve) {
-    if (!curve || curve->point_count == 0 || curve->point_count > NINEFAN_MAX_POINTS) return 0;
+    if (!curve || !curve->name || !curve->slug || !curve->summary
+        || curve->point_count == 0 || curve->point_count > NINEFAN_MAX_POINTS
+        || !isfinite(curve->activation_c)
+        || !isfinite(curve->release_hysteresis_c)
+        || curve->release_hysteresis_c < 0.0f) {
+        return 0;
+    }
     float previous_temperature = -INFINITY;
     float previous_fraction = 0.0f;
     for (size_t index = 0; index < curve->point_count; index++) {
         const ninefan_curve_point point = curve->points[index];
         if (!isfinite(point.temperature_c) || !isfinite(point.fan_fraction)) return 0;
-        if (point.temperature_c < previous_temperature) return 0;
+        if (index > 0 && point.temperature_c <= previous_temperature) return 0;
         if (point.fan_fraction < 0.0f || point.fan_fraction > 1.0f) return 0;
         if (index > 0 && point.fan_fraction < previous_fraction) return 0;
         previous_temperature = point.temperature_c;
         previous_fraction = point.fan_fraction;
     }
-    return 1;
+    return curve->points[0].temperature_c == curve->activation_c
+        && curve->points[curve->point_count - 1].fan_fraction == 1.0f;
 }

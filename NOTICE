@@ -5,7 +5,8 @@
 
 That project's M5 fan-mode key discovery, direct-mode behavior, AppleSMC
 write sequence, and default-restoration behavior are published under the MIT
-License. Copyright (c) 2026 Alexander Goodkind.
+License. Copyright (c) 2026 Alexander Goodkind. The complete applicable
+license notice is reproduced in THIRD_PARTY_LICENSES.
 
 9fan is an independent implementation. AppleSMC is a private, undocumented
 Apple interface. 9fan is not affiliated with or endorsed by Apple Inc.
