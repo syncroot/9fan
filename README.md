@@ -1,9 +1,14 @@
 # 9fan
 
 `9fan` is a tiny, dependency-free terminal fan controller for Apple Silicon
-Macs. Version 1.2 was built and read-only validated on an M5 Pro MacBook Pro.
-It probes the hardware at runtime instead of assuming fixed RPM values or
-fan-mode key casing.
+Macs. Version 1.2 was built and hardware-validated on one Mac17,9 M5 Pro
+MacBook Pro. It probes the hardware at runtime instead of assuming fixed RPM
+values or fan-mode key casing.
+
+> [!CAUTION]
+> `9fan` uses an undocumented AppleSMC interface and is not Apple-supported.
+> A passing self-test validates only the current app version, Mac, and macOS
+> build. Do not run it alongside another fan controller.
 
 The app is conservative by design:
 
@@ -58,6 +63,18 @@ These are bounded presets, not Apple-approved thermal specifications. Their
 math and controller state transitions are tested, while hardware acceptance
 must be checked with the guarded self-test on each Mac before a custom curve is
 allowed.
+
+## Verified hardware
+
+On 2026-07-18, the guarded self-test passed on one Mac17,9 Apple M5 Pro running
+macOS 26.5.2 (build 25F84). Both fans accepted their SMC-reported 7,826 RPM
+maximum target, accelerated to 6,895 and 6,801 RPM, and returned to Apple
+automatic mode with a zero target after the test.
+
+This result documents one hardware and OS combination; it is not an
+Apple endorsement or a guarantee for another Mac. `9fan` still requires every
+machine to pass its own guarded self-test, and invalidates that result after an
+app or macOS build change.
 
 ## Build and install
 
