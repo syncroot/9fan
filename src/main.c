@@ -5,6 +5,7 @@
 #include "signal_guard.h"
 #include "smc.h"
 #include "thermal_guard.h"
+#include "tui.h"
 #include "version.h"
 
 #include <errno.h>
@@ -293,58 +294,25 @@ static int print_status(void) {
         && ninefan_thermal_state_allows_control(thermal) ? 0 : 1;
 }
 
-static void render_event(ninefan_event *event) {
-    ninefan_protocol_sanitize_text(event->message, sizeof(event->message));
-    ninefan_protocol_sanitize_text(
-        event->thermal_state, sizeof(event->thermal_state));
-    ninefan_protocol_sanitize_text(
-        event->hottest_key, sizeof(event->hottest_key));
-    printf("\033[H\033[2J");
-    printf("\033[30;46;1m 9fan %-8s  PRIVILEGE-SEPARATED CONTROL \033[0m\r\n",
-        NINEFAN_VERSION);
-    printf("\r\n  Engine    root-only, fixed commands\r\n");
-    printf("  Thermal   %-12s", event->thermal_state);
-    if (event->temperature_valid) {
-        printf("  Hotspot %.1f C (%s)\r\n",
-            event->hotspot_c, event->hottest_key);
-    } else {
-        printf("  Hotspot unavailable\r\n");
+static void render_event(const ninefan_event *event) {
+    char frame[NINEFAN_TUI_FRAME_SIZE];
+    const int frame_size = ninefan_tui_render(
+        frame, sizeof(frame), event,
+        ninefan_tui_terminal_columns(STDOUT_FILENO), 1);
+    if (frame_size > 0) {
+        (void)fwrite(frame, 1, (size_t)frame_size, stdout);
+        fflush(stdout);
     }
-    const char *profile = "Apple default";
-    if (event->selected_curve >= NINEFAN_COMMAND_QUIET
-        && event->selected_curve <= NINEFAN_COMMAND_MAXIMUM) {
-        profile = ninefan_curves[event->selected_curve - 1].name;
-    }
-    printf("  Profile   %-13s  Lease %u:%02u\r\n\r\n",
-        profile,
-        event->lease_remaining_seconds / 60,
-        event->lease_remaining_seconds % 60);
-    for (uint8_t index = 0; index < event->fan_count; index++) {
-        const ninefan_protocol_fan *fan = &event->fans[index];
-        printf("  Fan %u  %5.0f RPM   target %5.0f   range %4.0f-%4.0f   %-6s\r\n",
-            index, fan->actual_rpm, fan->target_rpm,
-            fan->minimum_rpm, fan->maximum_rpm, mode_name(fan->mode));
-    }
-    printf("\r\n  [a] Apple default\r\n");
-    for (size_t index = 0; index < ninefan_curve_count; index++) {
-        printf("  [%zu] %-13s %s\r\n",
-            index + 1, ninefan_curves[index].name,
-            ninefan_curves[index].summary);
-    }
-    printf("\r\n  [q] Restore Apple default and quit\r\n");
-    printf("  Safety lease cannot be extended during this session.\r\n");
-    if (event->message[0]) printf("\r\n  %s\r\n", event->message);
-    fflush(stdout);
 }
 
 static int key_to_command(unsigned char key, ninefan_command *command) {
     if (!command) return 0;
     uint16_t kind;
-    if (key == 'a' || key == '0') {
+    if (key == 'a' || key == 'A' || key == '0') {
         kind = NINEFAN_COMMAND_DEFAULT;
     } else if (key >= '1' && key <= '4') {
         kind = (uint16_t)(key - '0');
-    } else if (key == 'q' || key == 3) {
+    } else if (key == 'q' || key == 'Q' || key == 3) {
         kind = NINEFAN_COMMAND_QUIT;
     } else {
         return 0;
