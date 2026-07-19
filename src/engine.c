@@ -1,5 +1,7 @@
+#include "channel.h"
 #include "curve.h"
 #include "controller.h"
+#include "guard_protocol.h"
 #include "lease.h"
 #include "platform_policy.h"
 #include "protocol.h"
@@ -20,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
@@ -29,15 +32,20 @@
 
 #define SAMPLE_INTERVAL_MS 2000
 #define WATCHDOG_HEARTBEAT_INTERVAL_MS 2000
-#define WATCHDOG_HEARTBEAT_BYTE 'H'
-#define WATCHDOG_CLEAN_BYTE 'C'
-#define WATCHDOG_ARM_BYTE 'A'
-#define WATCHDOG_MAXIMUM_BYTE 'M'
-#define WATCHDOG_READY_BYTE 'R'
+#define WATCHDOG_HEARTBEAT_BYTE NINEFAN_GUARD_HEARTBEAT_BYTE
+#define WATCHDOG_CLEAN_BYTE NINEFAN_GUARD_CLEAN_BYTE
+#define WATCHDOG_ARM_BYTE NINEFAN_GUARD_ARM_BYTE
+#define WATCHDOG_DISARM_BYTE NINEFAN_GUARD_DISARM_BYTE
+#define WATCHDOG_MAXIMUM_BYTE NINEFAN_GUARD_MAXIMUM_BYTE
+#define WATCHDOG_READY_BYTE NINEFAN_GUARD_READY_BYTE
 #define WATCHDOG_READY_TIMEOUT_MS 2000
 #define APPLE_HANDOFF_TEMPERATURE_C 90.0f
 #define HARDWARE_VALIDATION_PATH "/var/db/9fan.validation"
 #define HARDWARE_VALIDATION_RECORD_SIZE 512
+
+_Static_assert(
+    NINEFAN_PROTOCOL_IO_TIMEOUT_MS < NINEFAN_GUARD_TIMEOUT_MS,
+    "Protocol I/O must time out before the independent guard");
 
 static volatile sig_atomic_t termination_requested;
 
@@ -51,6 +59,7 @@ typedef struct {
 
 static int watchdog_heartbeat(ninefan_watchdog *watchdog, int force);
 static int watchdog_arm(ninefan_watchdog *watchdog);
+static int watchdog_disarm(ninefan_watchdog *watchdog);
 
 static int watchdog_progress(void *context) {
     return watchdog_heartbeat((ninefan_watchdog *)context, 1);
@@ -379,6 +388,7 @@ static void restore_after_control_failure(
     ninefan_controller *controller,
     ninefan_response_monitor *response_monitor,
     char *message, size_t message_size) {
+    controller->curve = NULL;
     if (ninefan_smc_restore_default(smc) == 0) {
         controller->manual_active = 0;
         ninefan_response_monitor_init(response_monitor);
@@ -408,6 +418,13 @@ static int update_controller(
             return -1;
         }
         if (!controller->manual_active && smc->fans[index].mode == 1) {
+            if (watchdog_disarm(watchdog) != 0) {
+                snprintf(message, message_size,
+                    "Fan %d entered manual mode under another controller, "
+                    "but the safety guard could not disarm",
+                    index);
+                return -1;
+            }
             snprintf(message, message_size,
                 "Fan %d entered manual mode under another controller; "
                 "stopping without overwriting it",
@@ -428,8 +445,17 @@ static int update_controller(
 
     if (!needs_manual) {
         if (controller->manual_active) {
-            return restore_controller(
-                smc, controller, response_monitor, message, message_size);
+            if (restore_controller(
+                    smc, controller, response_monitor,
+                    message, message_size) != 0) {
+                return -1;
+            }
+            if (watchdog_disarm(watchdog) != 0) {
+                snprintf(message, message_size,
+                    "Apple control was restored, but the safety guard "
+                    "could not disarm");
+                return -1;
+            }
         }
         return 0;
     }
@@ -575,6 +601,19 @@ static int watchdog_arm(ninefan_watchdog *watchdog) {
     return 0;
 }
 
+static int watchdog_disarm(ninefan_watchdog *watchdog) {
+    if (!watchdog || !watchdog->active) return -1;
+    if (!watchdog->armed) return 0;
+    const char disarm = WATCHDOG_DISARM_BYTE;
+    ssize_t written;
+    do {
+        written = write(watchdog->write_fd, &disarm, 1);
+    } while (written < 0 && errno == EINTR);
+    if (written != 1) return -1;
+    watchdog->armed = 0;
+    return 0;
+}
+
 static int watchdog_limit_maximum(ninefan_watchdog *watchdog) {
     if (!watchdog || !watchdog->active) return -1;
     const char limit = WATCHDOG_MAXIMUM_BYTE;
@@ -662,7 +701,7 @@ static int watchdog_start(
         execl(guard_path, guard_path,
             "--watch-fd", heartbeat_fd,
             "--ready-fd", ready_fd,
-            "--protocol", "2",
+            "--protocol", NINEFAN_GUARD_PROTOCOL_TEXT,
             "--lease-ms", lease_ms,
             (char *)NULL);
         _exit(127);
@@ -985,6 +1024,7 @@ static int run_session(
 
     long long next_sample = 0;
     int exit_code = 0;
+    int channel_usable = 1;
 
     while (!termination_requested) {
         const ninefan_lease_result lease_result =
@@ -1100,6 +1140,7 @@ static int run_session(
                     &lease, message) != 0) {
                 snprintf(message, sizeof(message),
                     "Frontend disconnected; restoring Apple control");
+                channel_usable = 0;
                 exit_code = 1;
                 break;
             }
@@ -1117,8 +1158,10 @@ static int run_session(
         } while (poll_result < 0 && errno == EINTR
             && !termination_requested);
         if (poll_result < 0) {
+            if (termination_requested) break;
             snprintf(message, sizeof(message),
                 "Frontend channel failed; restoring Apple control");
+            channel_usable = 0;
             exit_code = 1;
             break;
         }
@@ -1131,6 +1174,7 @@ static int run_session(
                 || !ninefan_protocol_command_valid(&command)) {
                 snprintf(message, sizeof(message),
                     "Invalid or closed frontend channel; restoring Apple control");
+                channel_usable = 0;
                 exit_code = 1;
                 break;
             }
@@ -1163,6 +1207,7 @@ static int run_session(
         if (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) {
             snprintf(message, sizeof(message),
                 "Frontend disconnected; restoring Apple control");
+            channel_usable = 0;
             exit_code = 1;
             break;
         }
@@ -1179,8 +1224,10 @@ static int run_session(
         snprintf(message, sizeof(message),
             "Engine terminated; Apple control restored");
     }
-    (void)send_event(NINEFAN_EVENT_EXIT, exit_code, smc,
-        &controller, &lease, message);
+    if (channel_usable) {
+        (void)send_event(NINEFAN_EVENT_EXIT, exit_code, smc,
+            &controller, &lease, message);
+    }
     return exit_code;
 }
 
@@ -1424,19 +1471,89 @@ static int parse_command(const char *text, uint16_t *command_out) {
     return 0;
 }
 
-static int protocol_descriptors_are_pipes(void) {
+static int sudo_invoking_uid(uid_t *uid_out) {
+    if (!uid_out) return -1;
+    const char *text = getenv("SUDO_UID");
+    if (!text || !text[0]) return -1;
+    for (const unsigned char *cursor = (const unsigned char *)text;
+         *cursor;
+         cursor++) {
+        if (*cursor < '0' || *cursor > '9') return -1;
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(text, &end, 10);
+    const uid_t uid = (uid_t)value;
+    if (errno != 0
+        || !end
+        || *end != '\0'
+        || value == 0
+        || (unsigned long)uid != value) {
+        return -1;
+    }
+    *uid_out = uid;
+    return 0;
+}
+
+static int configure_protocol_descriptor(int fd) {
+    const int status_flags = fcntl(fd, F_GETFL);
+    const int descriptor_flags = fcntl(fd, F_GETFD);
+    return status_flags >= 0
+        && descriptor_flags >= 0
+        && fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) == 0
+        && fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) == 0
+        ? 0
+        : -1;
+}
+
+static int install_protocol_channel(int channel_fd) {
+    if (channel_fd < 0
+        || dup2(channel_fd, STDIN_FILENO) < 0
+        || dup2(channel_fd, STDOUT_FILENO) < 0) {
+        return -1;
+    }
+    if (channel_fd != STDIN_FILENO && channel_fd != STDOUT_FILENO) {
+        close(channel_fd);
+    }
+    return configure_protocol_descriptor(STDIN_FILENO) == 0
+        && configure_protocol_descriptor(STDOUT_FILENO) == 0
+        ? 0
+        : -1;
+}
+
+static int protocol_descriptors_are_socket(void) {
     struct stat input = {0}, output = {0};
     const int input_flags = fcntl(STDIN_FILENO, F_GETFL);
     const int output_flags = fcntl(STDOUT_FILENO, F_GETFL);
+    const int input_descriptor_flags = fcntl(STDIN_FILENO, F_GETFD);
+    const int output_descriptor_flags = fcntl(STDOUT_FILENO, F_GETFD);
+    int input_type = 0, output_type = 0;
+    socklen_t input_type_size = sizeof(input_type);
+    socklen_t output_type_size = sizeof(output_type);
     return fstat(STDIN_FILENO, &input) == 0
         && fstat(STDOUT_FILENO, &output) == 0
-        && S_ISFIFO(input.st_mode)
-        && S_ISFIFO(output.st_mode)
+        && S_ISSOCK(input.st_mode)
+        && S_ISSOCK(output.st_mode)
+        && input.st_dev == output.st_dev
+        && input.st_ino == output.st_ino
         && input_flags >= 0
         && output_flags >= 0
+        && input_descriptor_flags >= 0
+        && output_descriptor_flags >= 0
         && (input_flags & O_NONBLOCK) != 0
         && (output_flags & O_NONBLOCK) != 0
-        && !(input.st_dev == output.st_dev && input.st_ino == output.st_ino);
+        && (input_descriptor_flags & FD_CLOEXEC) != 0
+        && (output_descriptor_flags & FD_CLOEXEC) != 0
+        && getsockopt(
+            STDIN_FILENO, SOL_SOCKET, SO_TYPE,
+            &input_type, &input_type_size) == 0
+        && getsockopt(
+            STDOUT_FILENO, SOL_SOCKET, SO_TYPE,
+            &output_type, &output_type_size) == 0
+        && input_type_size == sizeof(input_type)
+        && output_type_size == sizeof(output_type)
+        && input_type == SOCK_STREAM
+        && output_type == SOCK_STREAM;
 }
 
 int main(int argc, char **argv) {
@@ -1469,9 +1586,10 @@ int main(int argc, char **argv) {
     const int is_default =
         argc == 2 && strcmp(argv[1], "--default") == 0;
     const int is_session =
-        argc == 5
+        argc == 7
         && strcmp(argv[1], "--session") == 0
-        && strcmp(argv[3], "--lease-ms") == 0;
+        && strcmp(argv[3], "--lease-ms") == 0
+        && strcmp(argv[5], "--channel") == 0;
     const int is_self_test =
         argc == 5
         && strcmp(argv[1], "--self-test") == 0
@@ -1499,10 +1617,9 @@ int main(int argc, char **argv) {
                 argv[4], NINEFAN_CURVE_LEASE_MAX_MS,
                 &duration_ms) != 0
             || (initial_command == NINEFAN_COMMAND_MAXIMUM
-                && duration_ms > NINEFAN_MAX_CURVE_LEASE_MAX_MS)
-            || !protocol_descriptors_are_pipes()) {
+                && duration_ms > NINEFAN_MAX_CURVE_LEASE_MAX_MS)) {
             fprintf(stderr,
-                "9fan-engine: invalid session command, lease, or channel\n");
+                "9fan-engine: invalid session command or lease\n");
             return 2;
         }
     } else if (is_self_test
@@ -1512,6 +1629,29 @@ int main(int argc, char **argv) {
             || duration_ms != NINEFAN_SELF_TEST_LEASE_MS)) {
         fprintf(stderr, "9fan-engine: invalid self-test lease\n");
         return 2;
+    }
+
+    if (is_session) {
+        uid_t invoking_uid = (uid_t)-1;
+        if (sudo_invoking_uid(&invoking_uid) != 0) {
+            fprintf(stderr,
+                "9fan-engine: could not identify the invoking sudo user\n");
+            return 2;
+        }
+        const int channel_fd = ninefan_channel_connect(
+            argv[6], invoking_uid, NINEFAN_PROTOCOL_IO_TIMEOUT_MS,
+            &termination_requested);
+        if (channel_fd < 0) {
+            fprintf(stderr,
+                "9fan-engine: private protocol channel is invalid\n");
+            return 2;
+        }
+        if (install_protocol_channel(channel_fd) != 0
+            || !protocol_descriptors_are_socket()) {
+            fprintf(stderr,
+                "9fan-engine: private protocol channel is invalid\n");
+            return 2;
+        }
     }
 
     int control_lock = -1;

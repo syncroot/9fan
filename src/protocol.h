@@ -11,6 +11,7 @@
 #define NINEFAN_PROTOCOL_VERSION 1u
 #define NINEFAN_PROTOCOL_MESSAGE_SIZE 192
 #define NINEFAN_PROTOCOL_IO_TIMEOUT_MS 2000
+#define NINEFAN_PROTOCOL_MAX_FRAME_SIZE 512
 
 typedef enum {
     NINEFAN_COMMAND_DEFAULT = 0,
@@ -70,6 +71,9 @@ _Static_assert(
 _Static_assert(
     sizeof(ninefan_event) == 404,
     "The fixed event wire format changed");
+_Static_assert(
+    sizeof(ninefan_event) <= NINEFAN_PROTOCOL_MAX_FRAME_SIZE,
+    "The fixed event wire format exceeds the fixed frame-size bound");
 
 int ninefan_protocol_command_valid(const ninefan_command *command);
 int ninefan_protocol_event_valid(const ninefan_event *event);

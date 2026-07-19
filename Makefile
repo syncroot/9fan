@@ -8,16 +8,19 @@ TEST_TARGETS := $(BUILD_DIR)/test-curve $(BUILD_DIR)/test-controller \
 	$(BUILD_DIR)/test-smc-codec $(BUILD_DIR)/test-response-monitor \
 	$(BUILD_DIR)/test-thermal-guard $(BUILD_DIR)/test-signal-guard \
 	$(BUILD_DIR)/test-platform-policy $(BUILD_DIR)/test-lease \
-	$(BUILD_DIR)/test-protocol
+	$(BUILD_DIR)/test-protocol $(BUILD_DIR)/test-channel \
+	$(BUILD_DIR)/test-guard-protocol
 FRONTEND_SOURCES := src/main.c src/smc.c src/smc_codec.c src/curve.c \
-	src/protocol.c src/platform_policy.c src/signal_guard.c src/thermal_guard.m
+	src/protocol.c src/channel.c src/platform_policy.c src/signal_guard.c \
+	src/thermal_guard.m
 ENGINE_SOURCES := src/engine.c src/smc.c src/smc_codec.c src/curve.c src/controller.c \
 	src/response_monitor.c src/signal_guard.c src/thermal_guard.m
-ENGINE_SOURCES += src/platform_policy.c src/lease.c src/protocol.c
-GUARD_SOURCES := src/guard.c src/smc_codec.c src/lease.c
+ENGINE_SOURCES += src/platform_policy.c src/lease.c src/protocol.c src/channel.c
+GUARD_SOURCES := src/guard.c src/smc_codec.c src/lease.c src/guard_protocol.c
 HEADERS := src/smc.h src/smc_codec.h src/curve.h src/controller.h \
 	src/response_monitor.h src/signal_guard.h src/thermal_guard.h \
-	src/platform_policy.h src/lease.h src/protocol.h src/version.h
+	src/platform_policy.h src/lease.h src/protocol.h src/channel.h \
+	src/guard_protocol.h src/version.h
 BASE_CFLAGS := -std=c11 -Os -flto -Wall -Wextra -Wpedantic -Werror \
 	-fstack-protector-strong -D_FORTIFY_SOURCE=2
 ALL_CFLAGS := $(BASE_CFLAGS) $(CFLAGS)
@@ -90,6 +93,15 @@ $(BUILD_DIR)/test-protocol: tests/test_protocol.c src/protocol.c src/protocol.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) tests/test_protocol.c src/protocol.c -o $@
 
+$(BUILD_DIR)/test-channel: tests/test_channel.c src/channel.c src/channel.h
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) tests/test_channel.c src/channel.c -o $@
+
+$(BUILD_DIR)/test-guard-protocol: tests/test_guard_protocol.c src/guard_protocol.c src/guard_protocol.h
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) \
+		tests/test_guard_protocol.c src/guard_protocol.c -o $@
+
 test: $(TEST_TARGETS) | check-unprivileged
 	$(BUILD_DIR)/test-curve
 	$(BUILD_DIR)/test-controller
@@ -100,6 +112,8 @@ test: $(TEST_TARGETS) | check-unprivileged
 	$(BUILD_DIR)/test-platform-policy
 	$(BUILD_DIR)/test-lease
 	$(BUILD_DIR)/test-protocol
+	$(BUILD_DIR)/test-channel
+	$(BUILD_DIR)/test-guard-protocol
 
 analyze: | check-unprivileged
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/curve.c
@@ -117,6 +131,8 @@ analyze: | check-unprivileged
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/platform_policy.c
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/lease.c
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/protocol.c
+	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/channel.c
+	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/guard_protocol.c
 
 verify: all test analyze | check-unprivileged
 	git diff --check

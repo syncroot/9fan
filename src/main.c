@@ -1,3 +1,4 @@
+#include "channel.h"
 #include "curve.h"
 #include "platform_policy.h"
 #include "protocol.h"
@@ -23,6 +24,9 @@
 #include <unistd.h>
 
 #define ENGINE_PATH "/usr/local/libexec/9fan-engine"
+#define ENGINE_AUTHORIZATION_TIMEOUT_STEPS 600
+#define ENGINE_AUTHORIZATION_POLL_MS 200
+#define ENGINE_SHUTDOWN_TIMEOUT_MS 2000
 
 typedef struct {
     struct termios original;
@@ -69,6 +73,56 @@ static void terminal_enter(ninefan_terminal *terminal) {
 static void terminal_leave(ninefan_terminal *terminal) {
     if (!terminal || !terminal->active) return;
     terminal_restore();
+}
+
+static int wait_child_bounded(
+    pid_t child, int *status, int timeout_ms) {
+    if (child <= 0 || !status || timeout_ms < 0) return -1;
+    for (int elapsed = 0; elapsed <= timeout_ms; elapsed += 50) {
+        pid_t result;
+        do {
+            result = waitpid(child, status, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result == child) return 1;
+        if (result < 0) return -1;
+        if (elapsed == timeout_ms) break;
+        const int remaining = timeout_ms - elapsed;
+        (void)poll(NULL, 0, remaining < 50 ? remaining : 50);
+    }
+    return 0;
+}
+
+static int reap_child_with_escalation(
+    pid_t child, int *status, int terminate_first) {
+    if (terminate_first) (void)kill(child, SIGTERM);
+    int result =
+        wait_child_bounded(child, status, ENGINE_SHUTDOWN_TIMEOUT_MS);
+    if (result != 0) return result;
+    if (!terminate_first) (void)kill(child, SIGTERM);
+    result = wait_child_bounded(
+        child, status, ENGINE_SHUTDOWN_TIMEOUT_MS);
+    if (result != 0) return result;
+    (void)kill(child, SIGKILL);
+    return wait_child_bounded(
+        child, status, ENGINE_SHUTDOWN_TIMEOUT_MS);
+}
+
+static int discard_terminal_burst(void) {
+    for (int attempt = 0; attempt < 64; attempt++) {
+        struct pollfd descriptor = {
+            .fd = STDIN_FILENO,
+            .events = POLLIN,
+            .revents = 0,
+        };
+        const int result = poll(&descriptor, 1, 25);
+        if (result <= 0 || !(descriptor.revents & POLLIN)) return 1;
+        unsigned char discarded[64];
+        if (read(
+                STDIN_FILENO, discarded, sizeof(discarded)) <= 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static const char *mode_name(uint8_t mode) {
@@ -158,15 +212,6 @@ static int parse_duration_minutes(
     }
     *duration_ms = (uint64_t)value * 60000ULL;
     return 0;
-}
-
-static int configure_protocol_fd(int fd) {
-    const int flags = fcntl(fd, F_GETFL);
-    return flags >= 0
-        && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
-        && fcntl(fd, F_SETFD, FD_CLOEXEC) == 0
-        ? 0
-        : -1;
 }
 
 static int print_status(void) {
@@ -320,59 +365,85 @@ static int run_engine_session(
         fprintf(stderr, "9fan: %s\n", error);
         return 1;
     }
-    int commands[2] = {-1, -1};
-    int events[2] = {-1, -1};
-    if (pipe(commands) != 0
-        || pipe(events) != 0
-        || configure_protocol_fd(commands[0]) != 0
-        || configure_protocol_fd(commands[1]) != 0
-        || configure_protocol_fd(events[0]) != 0
-        || configure_protocol_fd(events[1]) != 0) {
-        fprintf(stderr, "9fan: could not create engine channel: %s\n",
-            strerror(errno));
-        if (commands[0] >= 0) close(commands[0]);
-        if (commands[1] >= 0) close(commands[1]);
-        if (events[0] >= 0) close(events[0]);
-        if (events[1] >= 0) close(events[1]);
+    ninefan_channel_listener listener = {
+        .listener_fd = -1,
+    };
+    if (ninefan_channel_listener_open(&listener) != 0) {
+        fprintf(stderr, "9fan: could not create the private engine channel\n");
         return 1;
     }
     const pid_t child = fork();
     if (child < 0) {
         fprintf(stderr, "9fan: could not start engine: %s\n", strerror(errno));
-        close(commands[0]);
-        close(commands[1]);
-        close(events[0]);
-        close(events[1]);
+        ninefan_channel_listener_cleanup(&listener);
         return 1;
     }
     if (child == 0) {
-        if (dup2(commands[0], STDIN_FILENO) < 0
-            || dup2(events[1], STDOUT_FILENO) < 0) {
-            _exit(127);
-        }
-        close(commands[0]);
-        close(commands[1]);
-        close(events[0]);
-        close(events[1]);
+        const int null_input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (null_input < 0 || dup2(null_input, STDIN_FILENO) < 0) _exit(127);
+        if (null_input != STDIN_FILENO) close(null_input);
         char initial[16], duration[32];
         snprintf(initial, sizeof(initial), "%u", initial_command);
         snprintf(duration, sizeof(duration), "%llu",
             (unsigned long long)duration_ms);
         execl("/usr/bin/sudo", "sudo", "--", ENGINE_PATH,
-            "--session", initial, "--lease-ms", duration, (char *)NULL);
+            "--session", initial, "--lease-ms", duration,
+            "--channel", listener.socket_path, (char *)NULL);
         _exit(127);
     }
-    close(commands[0]);
-    close(events[1]);
+
+    int channel_fd = -1;
+    int child_status = 0;
+    int child_reaped = 0;
+    int child_status_valid = 0;
+    for (int attempt = 0;
+         attempt < ENGINE_AUTHORIZATION_TIMEOUT_STEPS
+            && !termination_requested;
+         attempt++) {
+        channel_fd = ninefan_channel_accept(
+            &listener, 0, ENGINE_AUTHORIZATION_POLL_MS,
+            &termination_requested);
+        if (channel_fd >= 0) break;
+        if (channel_fd != NINEFAN_CHANNEL_ACCEPT_TIMEOUT) break;
+        const pid_t wait_result = waitpid(child, &child_status, WNOHANG);
+        if (wait_result == child) {
+            child_reaped = 1;
+            child_status_valid = 1;
+            break;
+        }
+        if (wait_result < 0 && errno != EINTR) {
+            if (errno == ECHILD) child_reaped = 1;
+            break;
+        }
+    }
+    ninefan_channel_listener_cleanup(&listener);
+    if (channel_fd < 0) {
+        if (!child_reaped) {
+            child_status_valid =
+                reap_child_with_escalation(
+                    child, &child_status, 1) == 1;
+        }
+        if (!termination_requested) {
+            fprintf(stderr,
+                "9fan: privileged engine did not establish a secure channel\n");
+        }
+        return child_status_valid && WIFEXITED(child_status)
+            ? WEXITSTATUS(child_status)
+            : 1;
+    }
 
     ninefan_terminal terminal = {0};
     terminal_enter(&terminal);
     int exit_code = 1;
     int engine_done = 0;
+    int suppress_terminal_input = 0;
     char final_message[NINEFAN_PROTOCOL_MESSAGE_SIZE] = {0};
     while (!termination_requested && !engine_done) {
+        if (suppress_terminal_input) {
+            suppress_terminal_input = !discard_terminal_burst();
+        }
         struct pollfd descriptors[2] = {
-            {.fd = events[0], .events = POLLIN | POLLHUP, .revents = 0},
+            {.fd = channel_fd, .events = POLLIN | POLLHUP, .revents = 0},
             {.fd = STDIN_FILENO,
              .events = terminal.active ? POLLIN : 0, .revents = 0},
         };
@@ -384,7 +455,7 @@ static int run_engine_session(
         if (descriptors[0].revents & POLLIN) {
             ninefan_event event = {0};
             if (ninefan_protocol_read_full(
-                    events[0], &event, sizeof(event),
+                    channel_fd, &event, sizeof(event),
                     NINEFAN_PROTOCOL_IO_TIMEOUT_MS,
                     &termination_requested) != 0
                 || !ninefan_protocol_event_valid(&event)) {
@@ -408,16 +479,20 @@ static int run_engine_session(
             }
         }
         if (terminal.active && (descriptors[1].revents & POLLIN)) {
-            unsigned char key = 0;
-            if (read(STDIN_FILENO, &key, 1) == 1) {
+            unsigned char input[64] = {0};
+            const ssize_t input_size =
+                read(STDIN_FILENO, input, sizeof(input));
+            if (input_size == 1 && input[0] != 27) {
                 ninefan_command command;
-                if (key_to_command(key, &command)
+                if (key_to_command(input[0], &command)
                     && ninefan_protocol_write_full(
-                           commands[1], &command, sizeof(command),
+                           channel_fd, &command, sizeof(command),
                            NINEFAN_PROTOCOL_IO_TIMEOUT_MS,
                            &termination_requested) != 0) {
                     break;
                 }
+            } else if (input_size > 0) {
+                suppress_terminal_input = !discard_terminal_burst();
             }
         }
         if (descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL)) break;
@@ -429,18 +504,21 @@ static int run_engine_session(
             .kind = NINEFAN_COMMAND_QUIT,
         };
         (void)ninefan_protocol_write_full(
-            commands[1], &quit, sizeof(quit),
+            channel_fd, &quit, sizeof(quit),
             NINEFAN_PROTOCOL_IO_TIMEOUT_MS, NULL);
     }
-    close(commands[1]);
-    close(events[0]);
-    if (!engine_done) (void)kill(child, SIGTERM);
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    close(channel_fd);
     terminal_leave(&terminal);
+    int status = 0;
+    const int child_wait_result =
+        reap_child_with_escalation(child, &status, !engine_done);
     if (!engine_done) {
-        if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
+        if (child_wait_result == 1 && WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        }
         else exit_code = 1;
+    } else if (child_wait_result != 1) {
+        exit_code = 1;
     }
     if (final_message[0]) {
         FILE *stream = exit_code == 0 ? stdout : stderr;

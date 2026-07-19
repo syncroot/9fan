@@ -34,7 +34,18 @@ system logs.
   a controller death or six-second timeout.
 - The terminal frontend runs as the invoking user and has no SMC write path.
   The on-demand root engine accepts only fixed commands over a fixed-size,
-  versioned pipe protocol; it accepts no raw SMC keys or RPM values.
+  versioned protocol on a one-use private Unix socket; it accepts no raw SMC
+  keys or RPM values.
+- The socket directory is mode `0700`, the socket is mode `0600`, both are
+  owned by the invoking user, and their path has one exact constrained shape.
+  The engine verifies the frontend UID with kernel peer credentials; the
+  frontend independently requires a root peer. The pathname is unlinked
+  immediately after acceptance.
+- Session descriptors are nonblocking and close-on-exec, so protocol I/O has a
+  deadline and the independent guard cannot retain the engine connection.
+- The guard has explicit arm and disarm states. It is armed before the first
+  manual-mode write and disarmed only after 9fan verifies Apple automatic mode,
+  preventing a later clean shutdown from overwriting another controller.
 - The engine and guard independently enforce a non-extendable control lease
   using a clock that includes time asleep. A sleep/scheduling gap restores
   Apple control, and Maximum shortens the session to ten minutes.

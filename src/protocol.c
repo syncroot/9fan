@@ -60,7 +60,7 @@ static int io_parameters_valid(
     int fd, const void *buffer, size_t size, int timeout_ms) {
     return fd >= 0
         && (buffer || size == 0)
-        && size <= PIPE_BUF
+        && size <= NINEFAN_PROTOCOL_MAX_FRAME_SIZE
         && timeout_ms > 0;
 }
 

@@ -71,6 +71,12 @@ Long legacy mode transitions continue sending watchdog heartbeats; a failed
 interactive request to restore Apple control terminates with an error instead
 of continuing without watchdog coverage.
 
+When an active curve falls below its manual-control threshold, 9fan first
+verifies Apple automatic mode and then disarms the guard. If another controller
+subsequently selects manual mode, 9fan exits without having a clean guard
+shutdown overwrite that controller. Any unexpected guard-channel failure still
+uses the fail-safe Apple restoration path.
+
 If the display is unresponsive, run the explicit recovery command from another
 terminal:
 

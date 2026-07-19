@@ -1,3 +1,4 @@
+#include "guard_protocol.h"
 #include "smc_codec.h"
 #include "lease.h"
 
@@ -16,12 +17,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define GUARD_HEARTBEAT_BYTE 'H'
-#define GUARD_CLEAN_BYTE 'C'
-#define GUARD_ARM_BYTE 'A'
-#define GUARD_MAXIMUM_BYTE 'M'
-#define GUARD_READY_BYTE 'R'
-#define GUARD_TIMEOUT_MS 6000
 #define GUARD_RESTORE_ATTEMPTS 120
 #define GUARD_RESTORE_RETRY_NS 500000000L
 #define GUARD_MAX_FANS 8
@@ -349,7 +344,7 @@ static int parse_duration_ms(const char *text, uint64_t *value_out) {
 
 static int monitor_parent(int read_fd, ninefan_lease *lease) {
     uint64_t last_heartbeat_ns = ninefan_continuous_time_ns();
-    int armed = 0;
+    ninefan_guard_protocol_state protocol = {0};
     if (last_heartbeat_ns == 0) return 1;
     for (;;) {
         const uint64_t before_poll_ns = ninefan_continuous_time_ns();
@@ -358,7 +353,7 @@ static int monitor_parent(int read_fd, ninefan_lease *lease) {
                 != NINEFAN_LEASE_OK
             || before_poll_ns < last_heartbeat_ns
             || before_poll_ns - last_heartbeat_ns
-                >= (uint64_t)GUARD_TIMEOUT_MS * 1000000ULL) {
+                >= (uint64_t)NINEFAN_GUARD_TIMEOUT_MS * 1000000ULL) {
             return 1;
         }
         struct pollfd descriptor = {
@@ -376,7 +371,7 @@ static int monitor_parent(int read_fd, ninefan_lease *lease) {
                 != NINEFAN_LEASE_OK
             || after_poll_ns < last_heartbeat_ns
             || after_poll_ns - last_heartbeat_ns
-                >= (uint64_t)GUARD_TIMEOUT_MS * 1000000ULL) {
+                >= (uint64_t)NINEFAN_GUARD_TIMEOUT_MS * 1000000ULL) {
             return 1;
         }
         if (poll_result == 0) continue;
@@ -385,19 +380,19 @@ static int monitor_parent(int read_fd, ninefan_lease *lease) {
         const ssize_t count = read(read_fd, bytes, sizeof(bytes));
         if (count <= 0) return 1;
         for (ssize_t index = 0; index < count; index++) {
-            if (bytes[index] == GUARD_CLEAN_BYTE) return armed;
-            if (bytes[index] == GUARD_ARM_BYTE) {
-                armed = 1;
-                continue;
+            const ninefan_guard_protocol_action action =
+                ninefan_guard_protocol_process(&protocol, bytes[index]);
+            if (action == NINEFAN_GUARD_CLEAN_NO_RESTORE) return 0;
+            if (action == NINEFAN_GUARD_CLEAN_RESTORE
+                || action == NINEFAN_GUARD_INVALID) {
+                return 1;
             }
-            if (bytes[index] == GUARD_MAXIMUM_BYTE) {
+            if (action == NINEFAN_GUARD_LIMIT_MAXIMUM) {
                 if (ninefan_lease_shorten(
                         lease, NINEFAN_MAX_CURVE_LEASE_MAX_MS,
                         after_poll_ns) != 0) {
                     return 1;
                 }
-            } else if (bytes[index] != GUARD_HEARTBEAT_BYTE) {
-                return 1;
             }
         }
         last_heartbeat_ns = after_poll_ns;
@@ -422,7 +417,7 @@ int main(int argc, char **argv) {
         || strcmp(argv[1], "--watch-fd") != 0
         || strcmp(argv[3], "--ready-fd") != 0
         || strcmp(argv[5], "--protocol") != 0
-        || strcmp(argv[6], "2") != 0
+        || strcmp(argv[6], NINEFAN_GUARD_PROTOCOL_TEXT) != 0
         || strcmp(argv[7], "--lease-ms") != 0
         || geteuid() != 0) {
         return 2;
@@ -455,7 +450,7 @@ int main(int argc, char **argv) {
     signal(SIGQUIT, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
 
-    const char ready = GUARD_READY_BYTE;
+    const char ready = NINEFAN_GUARD_READY_BYTE;
     if (write(ready_fd, &ready, 1) != 1) {
         close(ready_fd);
         close(read_fd);

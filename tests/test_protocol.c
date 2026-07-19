@@ -48,7 +48,7 @@ int main(void) {
     assert(ninefan_protocol_read_full(
         descriptors[0], &received, sizeof(received), 100,
         &abort_requested) != 0);
-    unsigned char oversized[PIPE_BUF + 1] = {0};
+    unsigned char oversized[NINEFAN_PROTOCOL_MAX_FRAME_SIZE + 1] = {0};
     assert(ninefan_protocol_write_full(
         descriptors[1], oversized, sizeof(oversized), 100, NULL) != 0);
     close(descriptors[0]);
