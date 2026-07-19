@@ -174,7 +174,7 @@ install:
 	test "$(PREFIX)" = "/usr/local"
 	test -z "$(DESTDIR)"
 	test ! -L build
-	test "$$(/usr/bin/realpath build)" = "$$(pwd -P)/build"
+	test "$$(cd -P build && pwd -P)" = "$$(pwd -P)/build"
 	test "$$(/usr/bin/stat -f %u build)" = "$$(/usr/bin/id -u)"
 	test "$$(/usr/bin/stat -f %Lp build)" = 755
 	test -f build/SHA256SUMS
@@ -199,8 +199,8 @@ install:
 	/usr/bin/shasum -a 256 -c build/SOURCE_SHA256SUMS
 	test ! -L "/usr/local"
 	test ! -L "/usr/local/bin"
-	test "$$(/usr/bin/realpath /usr/local)" = "/usr/local"
-	test "$$(/usr/bin/realpath /usr/local/bin)" = "/usr/local/bin"
+	test "$$(cd -P /usr/local && pwd -P)" = "/usr/local"
+	test "$$(cd -P /usr/local/bin && pwd -P)" = "/usr/local/bin"
 	test "$$(/usr/bin/stat -f %u /usr/local)" = 0
 	test "$$(/usr/bin/stat -f %Lp /usr/local)" = 755
 	test "$$(/usr/bin/stat -f %u /usr/local/bin)" = 0
@@ -212,7 +212,7 @@ install:
 	/usr/bin/sudo /bin/rm -f /var/db/9fan.validation
 	test ! -e /usr/local/libexec || test ! -L /usr/local/libexec
 	test -e /usr/local/libexec || /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 755 /usr/local/libexec
-	test "$$(/usr/bin/realpath /usr/local/libexec)" = "/usr/local/libexec"
+	test "$$(cd -P /usr/local/libexec && pwd -P)" = "/usr/local/libexec"
 	test "$$(/usr/bin/stat -f %u /usr/local/libexec)" = 0
 	test "$$(/usr/bin/stat -f %Lp /usr/local/libexec)" = 755
 	test ! -L /usr/local/bin/9fan
