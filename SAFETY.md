@@ -12,7 +12,9 @@ Apple's firmware thermal protections.
 2. Run `9fan status`; confirm every fan has a valid minimum and maximum.
 3. Confirm `Temp keys` does not report `(INCOMPLETE)`.
 4. Stop any other fan-control utility.
-5. Run the guarded self-test while the Mac is cool and idle.
+5. Confirm the guarded self-test requested at the end of `make install` while
+   the Mac is cool and idle. Run `9fan self-test` again whenever validation is
+   missing or stale.
 
 The self-test refuses to run above an 80 C hotspot. Non-interactive runs require
 the explicit `self-test --yes` command. It raises fans to their reported maximum

@@ -121,11 +121,24 @@ make install
 
 Never run `sudo make`, including `sudo make install`. `make verify` builds,
 tests, analyzes, and hashes all three binaries as your normal user. The
-unprivileged `make install` target verifies those hashes and directory safety,
-snapshots the transaction manifests as root, verifies root-owned temporary
-copies, then invokes only fixed absolute-path system utilities through `sudo`
-for atomic installation. The resulting installed digest is root-owned at
-`/usr/local/libexec/9fan.SHA256SUMS`.
+interactive, unprivileged `make install` target verifies those hashes and
+the source-tree checksum from a clean `make verify`, checks directory safety,
+invalidates prior hardware validation, verifies root-owned temporary copies,
+and invokes fixed absolute-path system utilities through `sudo` for atomic
+per-file replacement. Root never interprets a user-writable checksum manifest.
+It then requires confirmation for the guarded hardware self-test and finishes
+with read-only status. Cancellation, interruption, or failure leaves custom
+curves disabled and makes the target fail safely. The resulting installed
+digest is root-owned at `/usr/local/libexec/9fan.SHA256SUMS`.
+
+Installation refuses a duplicate `~/.local/bin/9fan`, any other `9fan` that
+shadows the installed path, or a PATH without `/usr/local/bin`. This prevents
+an older executable from shadowing or confusing the verified
+`/usr/local/bin/9fan`. Run `make verify` again after every source or
+documentation edit; installation refuses a stale source checksum. A retry
+removes fixed-name staging leftovers and safely replaces a partially installed
+or checksum-inconsistent set from the newly verified build, while hardware
+validation remains disabled until the new self-test succeeds.
 
 The installed paths are:
 

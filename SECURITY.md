@@ -60,7 +60,20 @@ system logs.
   and after guard startup. A local self-test cannot enroll unknown hardware.
 - Read-only commands do not take the control lock or write SMC keys.
 - Builds, tests, analysis, and hashing run unprivileged. Installation invokes
-  only fixed absolute-path system copy/compare/rename utilities through sudo;
-  `sudo make` is unsupported and unsafe.
+  only fixed absolute-path installation utilities through sudo;
+  root never interprets a user-writable checksum manifest, and `sudo make` is
+  unsupported and unsafe.
+- Installation requires an interactive terminal, refuses the known
+  user-local duplicate path and any PATH shadow, and completes only after the
+  guarded self-test and final read-only status both succeed. It invalidates the
+  old validation marker before replacement, so a failed, interrupted, or
+  cancelled install leaves custom curves disabled.
+- `make verify` performs a clean rebuild and records checksums for both the
+  binaries and every tracked source file. Installation rechecks both before
+  and during the transaction, refusing stale build output after a source edit.
+- A retry deletes only fixed-name transaction staging files and replaces an
+  inconsistent installed set from the freshly verified build. It does not run
+  the inconsistent binaries, and custom curves remain disabled until the
+  guarded self-test succeeds.
 
 Recovery and limitations are documented in `SAFETY.md`.
