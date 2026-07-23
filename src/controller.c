@@ -62,6 +62,17 @@ int ninefan_controller_compute(ninefan_controller *controller) {
     return 1;
 }
 
+int ninefan_controller_force_maximum(ninefan_controller *controller) {
+    if (!controller
+        || !controller->curve
+        || !controller->temperature_valid
+        || !isfinite(controller->current_temperature)) {
+        return 0;
+    }
+    controller->requested_fraction = 1.0f;
+    return 1;
+}
+
 float ninefan_controller_target(
     const ninefan_controller *controller,
     float minimum_rpm,

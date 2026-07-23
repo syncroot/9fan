@@ -8,7 +8,7 @@ const ninefan_curve ninefan_curves[] = {
     {
         .name = "Quiet",
         .slug = "quiet",
-        .summary = "Apple auto <65C; 65C min, 75C 35%, 82C 70%, 90C max",
+        .summary = "Apple auto <65C; 65C min, 75C 35%, 82C safety max",
         .activation_c = 65.0f,
         .release_hysteresis_c = 4.0f,
         .points = {{65.0f, 0.00f}, {75.0f, 0.35f}, {82.0f, 0.70f}, {90.0f, 1.00f}},
@@ -17,7 +17,7 @@ const ninefan_curve ninefan_curves[] = {
     {
         .name = "Balanced",
         .slug = "balanced",
-        .summary = "Apple auto <55C; 55C min, 67C 35%, 78C 70%, 88C max",
+        .summary = "Apple auto <55C; 55C min, 67C 35%, 78C 70%, 82C safety max",
         .activation_c = 55.0f,
         .release_hysteresis_c = 4.0f,
         .points = {{55.0f, 0.00f}, {67.0f, 0.35f}, {78.0f, 0.70f}, {88.0f, 1.00f}},

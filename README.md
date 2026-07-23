@@ -1,7 +1,7 @@
 # 9fan
 
 `9fan` is a small, dependency-free terminal fan controller for one explicitly
-verified Apple Silicon platform. Version 1.5.0 separates the normal-user
+verified Apple Silicon platform. Version 1.5.1 separates the normal-user
 terminal frontend from a minimal, on-demand root control engine. The only
 currently allowlisted profile is the locally tested Mac17,9 M5 Pro and macOS
 build documented below.
@@ -25,8 +25,18 @@ The app is conservative by design:
 - Temperature rise is applied immediately; release is damped to prevent hunting.
 - A missing or unreadable temperature sensor immediately surrenders to Apple's
   controller.
-- A 90 C hotspot immediately surrenders to Apple instead of keeping a manual
-  ceiling.
+- At 82 C, every active curve is raised to the verified manual maximum,
+  regardless of its normal curve points. At 90 C, 9fan restores Apple control
+  because macOS may command beyond that manual ceiling. The terminal remains
+  open to show Apple's live response, and normal curves stay locked until the
+  hotspot falls to 80 C.
+- While that lockout is active, an explicit Maximum selection can start one
+  guarded 15-second hot-start boost per lockout. It is allowed only while Apple's thermal
+  state is nominal or fair and only when taking manual mode cannot lower the
+  currently observed Apple target or fan speed. An independent 20-second guard
+  limit restores Apple control if the engine misses its own deadline.
+- Temperature sampling accelerates from every two seconds to every 500 ms above
+  75 C, providing faster reaction only when the extra SMC reads are justified.
 - Apple's supported
   [`ProcessInfo.thermalState`](https://developer.apple.com/documentation/foundation/processinfo/thermalstate-swift.property)
   is checked before control and every 200 ms while active. Serious, critical,
@@ -64,7 +74,9 @@ The app is conservative by design:
 - Every session has a non-extendable, sleep-aware lease. Quiet, Balanced, and
   Performance are limited to 30 minutes; selecting Maximum shortens the
   remaining session to at most 10 minutes. Self-test is limited to two minutes.
-  Expiration or a sleep/scheduling gap restores Apple control.
+  A hot-start Maximum controls for at most 15 seconds and its independent guard
+  is limited to 20 seconds. Expiration or a sleep/scheduling gap restores Apple
+  control.
 
 ## Curves
 
@@ -74,8 +86,8 @@ maximum, not a percentage of absolute RPM.
 | Curve | Behavior |
 | --- | --- |
 | Apple default | macOS `thermalmonitord` controls the fans, including 0 RPM |
-| Quiet | Apple auto below 65 C; 65 C min, 75 C 35%, 82 C 70%, 90 C max |
-| Balanced | Apple auto below 55 C; 55 C min, 67 C 35%, 78 C 70%, 88 C max |
+| Quiet | Apple auto below 65 C; 65 C min, 75 C 35%, 82 C safety maximum |
+| Balanced | Apple auto below 55 C; 55 C min, 67 C 35%, 78 C 70%, 82 C safety maximum |
 | Performance | Apple auto below 40 C; 40 C min, 55 C 45%, 68 C 75%, 82 C max |
 | Maximum | SMC-reported maximum at every temperature |
 
@@ -84,10 +96,18 @@ above its reported maximum. This matters on M5, whose firmware behavior differs
 from earlier Apple Silicon generations. A zero or otherwise invalid reported
 manual minimum is rejected rather than written as a target.
 
+The curve table describes normal behavior below the safety overlay. Every
+active curve requests the verified maximum at 82 C, before the 90 C Apple
+handoff threshold.
+
 The reported maximum is a conservative manual ceiling, not the fan's physical
 limit. Apple may command higher emergency cooling, so the Maximum preset is not
 an emergency mode and 9fan hands control back to Apple at 90 C or on sensor
-loss.
+loss. A temperature handoff no longer closes the interactive session: 9fan
+continues displaying Apple's fan targets and actual RPM. During the lockout,
+  pressing `4` requests the separately bounded hot-start maximum once per
+  lockout; Quiet, Balanced, and Performance remain unavailable until the
+  hotspot reaches 80 C.
 
 These are bounded presets, not Apple-approved thermal specifications. Their
 math and controller state transitions are tested. Manual writes are compiled
@@ -103,7 +123,7 @@ and returned to Apple automatic mode with a zero target after the test. The
 validated SMC schema fingerprint was `651d1eadd3e88f2a`.
 
 This result documents one hardware and OS combination; it is not an Apple
-endorsement or a guarantee for another Mac. Version 1.5.0 permits manual
+endorsement or a guarantee for another Mac. Version 1.5.1 permits manual
 control only when the complete observed identity matches this compiled profile:
 `Mac17,9`, `Apple M5 Pro`, `25F84`, two fans, `F%dmd`, and schema
 `651d1eadd3e88f2a`. It also requires that machine to pass the guarded self-test
@@ -142,9 +162,9 @@ validation remains disabled until the new self-test succeeds.
 
 The installed paths are:
 
-- `/usr/local/bin/9fan` — normal-user frontend
-- `/usr/local/libexec/9fan-engine` — on-demand root controller
-- `/usr/local/libexec/9fan-guard` — independent root recovery process
+- `/usr/local/bin/9fan`: normal-user frontend
+- `/usr/local/libexec/9fan-engine`: on-demand root controller
+- `/usr/local/libexec/9fan-guard`: independent root recovery process
 
 Control sessions and self-test refuse to run unless the engine, its directory,
 and its guard are root-owned mode `0755`. The narrow `--default` recovery path

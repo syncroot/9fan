@@ -21,6 +21,10 @@
 #define GUARD_RESTORE_RETRY_NS 500000000L
 #define GUARD_MAX_FANS 8
 
+_Static_assert(
+    NINEFAN_HOT_START_GUARD_MS < NINEFAN_MAX_CURVE_LEASE_MAX_MS,
+    "The hot-start guard must be shorter than the Maximum session lease");
+
 typedef struct {
     uint8_t major, minor, build, reserved;
     uint16_t release;
@@ -390,6 +394,12 @@ static int monitor_parent(int read_fd, ninefan_lease *lease) {
             if (action == NINEFAN_GUARD_LIMIT_MAXIMUM) {
                 if (ninefan_lease_shorten(
                         lease, NINEFAN_MAX_CURVE_LEASE_MAX_MS,
+                        after_poll_ns) != 0) {
+                    return 1;
+                }
+            } else if (action == NINEFAN_GUARD_LIMIT_HOT_START) {
+                if (ninefan_lease_shorten(
+                        lease, NINEFAN_HOT_START_GUARD_MS,
                         after_poll_ns) != 0) {
                     return 1;
                 }

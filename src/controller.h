@@ -23,6 +23,7 @@ void ninefan_controller_reset_runtime(ninefan_controller *controller);
  * required, 0 when Apple automatic control should remain active.
  */
 int ninefan_controller_compute(ninefan_controller *controller);
+int ninefan_controller_force_maximum(ninefan_controller *controller);
 float ninefan_controller_target(
     const ninefan_controller *controller,
     float minimum_rpm,

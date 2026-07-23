@@ -37,10 +37,27 @@ Manual writes are additionally limited to the exact compiled platform profile.
 Unknown models, OS builds, fan layouts, key formats, and SMC schemas cannot
 self-enroll; only read-only status and Apple-default recovery remain available.
 
-The SMC-reported maximum is not necessarily the physical maximum. A custom
-curve exits and restores Apple control if temperature telemetry is lost, the
-hotspot reaches 90 C, or Apple's system thermal state becomes serious, critical,
-or unknown, allowing macOS to use its full emergency cooling policy.
+The SMC-reported maximum is not necessarily the physical maximum. Every active
+curve is raised to that verified manual maximum at 82 C. At 90 C, 9fan restores
+Apple control, allowing macOS to use its full emergency cooling policy. The
+interactive session remains open to display Apple's response, but normal curves
+are locked until the hotspot falls to 80 C. Sensor sampling accelerates to
+500 ms above 75 C so the pre-handoff maximum is less likely to be skipped by a
+rapid temperature rise. Temperature telemetry loss still
+ends custom control, and a serious, critical, or unknown Apple thermal state
+restores Apple control without closing an otherwise healthy interactive
+session.
+
+During a hot lockout, selecting Maximum explicitly may start one 15-second
+hot-start boost per lockout. It is refused unless Apple reports a nominal or fair thermal
+state, every fan remains in Apple mode, and neither Apple's current target nor
+the observed RPM exceeds 9fan's verified manual ceiling. Quiet, Balanced, and
+Performance cannot bypass the lockout. The guard independently limits this
+operation to 20 seconds, fan response remains monitored, and cooling returns to
+Apple immediately if the hotspot reaches the 80 C rearm point, Apple changes
+the mode, telemetry fails, or the system thermal state becomes unsafe. Another
+hot-start cannot be requested until the hotspot reaches 80 C and rearms the
+policy.
 
 After an eight-second spin-up allowance, active control continuously verifies
 that each fan physically follows a conservative fraction of its requested
@@ -49,9 +66,10 @@ change causes Apple handoff.
 
 Quiet, Balanced, and Performance have a non-extendable 30-minute session lease.
 Maximum shortens the remaining session to no more than 10 minutes, and
-self-test has a two-minute lease. Both the engine and independent guard enforce
-time using a clock that includes sleep. Expiration or a sleep/scheduling gap
-restores Apple control. Restarting control requires fresh authorization and all
+self-test has a two-minute lease. A hot-start Maximum is additionally bounded
+to 15 seconds by the engine and 20 seconds by the independent guard. Both use a
+clock that includes sleep. Expiration or a sleep/scheduling gap restores Apple
+control. Restarting control requires fresh authorization and all
 preflight checks.
 
 ## Recovery

@@ -15,6 +15,8 @@ ninefan_guard_protocol_action ninefan_guard_protocol_process(
             return NINEFAN_GUARD_CONTINUE;
         case NINEFAN_GUARD_MAXIMUM_BYTE:
             return NINEFAN_GUARD_LIMIT_MAXIMUM;
+        case NINEFAN_GUARD_HOT_START_BYTE:
+            return NINEFAN_GUARD_LIMIT_HOT_START;
         case NINEFAN_GUARD_CLEAN_BYTE:
             return state->armed
                 ? NINEFAN_GUARD_CLEAN_RESTORE

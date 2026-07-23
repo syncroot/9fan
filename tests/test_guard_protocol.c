@@ -23,6 +23,10 @@ int main(void) {
         == NINEFAN_GUARD_LIMIT_MAXIMUM);
     assert(state.armed);
     assert(ninefan_guard_protocol_process(
+        &state, NINEFAN_GUARD_HOT_START_BYTE)
+        == NINEFAN_GUARD_LIMIT_HOT_START);
+    assert(state.armed);
+    assert(ninefan_guard_protocol_process(
         &state, NINEFAN_GUARD_CLEAN_BYTE)
         == NINEFAN_GUARD_CLEAN_RESTORE);
 

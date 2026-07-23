@@ -18,9 +18,17 @@ system logs.
 
 ## Safety invariants
 
-- A temperature sensor failure, a 90 C hotspot, or a serious, critical, or
+- Every active curve is raised to the verified manual maximum at 82 C. A
+  temperature sensor failure, a 90 C hotspot, or a serious, critical, or
   unknown Apple thermal state surrenders to Apple's thermal controller, which
-  can command beyond the reported manual RPM range.
+  can command beyond the reported manual RPM range. A temperature handoff
+  keeps the terminal monitor open and locks normal-curve re-entry until 80 C.
+- An explicit Maximum selection during that lockout is restricted to one
+  15-second hot-start boost per lockout and cannot be repeated until the
+  hotspot reaches 80 C. It is refused if Apple is already targeting or
+  achieving above the verified manual ceiling, if any fan is outside Apple
+  mode, or if Apple's system thermal state is unsafe. The independent guard
+  applies a separate 20-second limit.
 - A fan telemetry failure surrenders control to Apple's thermal controller.
 - Active control detects repeated physical fan under-response and unexplained
   target changes.
@@ -48,7 +56,8 @@ system logs.
   preventing a later clean shutdown from overwriting another controller.
 - The engine and guard independently enforce a non-extendable control lease
   using a clock that includes time asleep. A sleep/scheduling gap restores
-  Apple control, and Maximum shortens the session to ten minutes.
+  Apple control, Maximum shortens the session to ten minutes, and a hot-start
+  maximum has separate 15-second engine and 20-second guard limits.
 - Startup explicitly unblocks handled termination signals and checks every
   handler installation call; control is refused if installation fails.
 - Only one privileged controller or self-test may run at a time.

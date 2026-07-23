@@ -2,6 +2,7 @@
 #include "curve.h"
 #include "controller.h"
 #include "guard_protocol.h"
+#include "hot_policy.h"
 #include "lease.h"
 #include "platform_policy.h"
 #include "protocol.h"
@@ -30,22 +31,24 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SAMPLE_INTERVAL_MS 2000
 #define WATCHDOG_HEARTBEAT_INTERVAL_MS 2000
 #define WATCHDOG_HEARTBEAT_BYTE NINEFAN_GUARD_HEARTBEAT_BYTE
 #define WATCHDOG_CLEAN_BYTE NINEFAN_GUARD_CLEAN_BYTE
 #define WATCHDOG_ARM_BYTE NINEFAN_GUARD_ARM_BYTE
 #define WATCHDOG_DISARM_BYTE NINEFAN_GUARD_DISARM_BYTE
 #define WATCHDOG_MAXIMUM_BYTE NINEFAN_GUARD_MAXIMUM_BYTE
+#define WATCHDOG_HOT_START_BYTE NINEFAN_GUARD_HOT_START_BYTE
 #define WATCHDOG_READY_BYTE NINEFAN_GUARD_READY_BYTE
 #define WATCHDOG_READY_TIMEOUT_MS 2000
-#define APPLE_HANDOFF_TEMPERATURE_C 90.0f
 #define HARDWARE_VALIDATION_PATH "/var/db/9fan.validation"
 #define HARDWARE_VALIDATION_RECORD_SIZE 512
 
 _Static_assert(
     NINEFAN_PROTOCOL_IO_TIMEOUT_MS < NINEFAN_GUARD_TIMEOUT_MS,
     "Protocol I/O must time out before the independent guard");
+_Static_assert(
+    NINEFAN_HOT_START_CONTROL_MS < NINEFAN_HOT_START_GUARD_MS,
+    "The independent hot-start guard must outlive the engine deadline");
 
 static volatile sig_atomic_t termination_requested;
 
@@ -406,6 +409,7 @@ static int update_controller(
     ninefan_controller *controller,
     ninefan_response_monitor *response_monitor,
     ninefan_watchdog *watchdog,
+    int force_maximum,
     char *message, size_t message_size) {
     if (!controller->curve) return 0;
 
@@ -442,6 +446,14 @@ static int update_controller(
     }
 
     const int needs_manual = ninefan_controller_compute(controller);
+    if (needs_manual && force_maximum
+        && !ninefan_controller_force_maximum(controller)) {
+        snprintf(message, message_size,
+            "Pre-handoff maximum request failed; restoring Apple control");
+        restore_after_control_failure(
+            smc, controller, response_monitor, message, message_size);
+        return -1;
+    }
 
     if (!needs_manual) {
         if (controller->manual_active) {
@@ -617,6 +629,16 @@ static int watchdog_disarm(ninefan_watchdog *watchdog) {
 static int watchdog_limit_maximum(ninefan_watchdog *watchdog) {
     if (!watchdog || !watchdog->active) return -1;
     const char limit = WATCHDOG_MAXIMUM_BYTE;
+    ssize_t written;
+    do {
+        written = write(watchdog->write_fd, &limit, 1);
+    } while (written < 0 && errno == EINTR);
+    return written == 1 ? 0 : -1;
+}
+
+static int watchdog_limit_hot_start(ninefan_watchdog *watchdog) {
+    if (!watchdog || !watchdog->active) return -1;
+    const char limit = WATCHDOG_HOT_START_BYTE;
     ssize_t written;
     do {
         written = write(watchdog->write_fd, &limit, 1);
@@ -838,11 +860,45 @@ static int send_event(
         NINEFAN_PROTOCOL_IO_TIMEOUT_MS, &termination_requested);
 }
 
+static int hot_start_preflight(
+    const ninefan_smc *smc,
+    const ninefan_controller *controller,
+    char *message,
+    size_t message_size) {
+    if (!smc
+        || !controller
+        || !controller->temperature_valid
+        || !isfinite(controller->current_temperature)
+        || controller->current_temperature < NINEFAN_APPLE_HANDOFF_C) {
+        snprintf(message, message_size,
+            "Hot-start maximum requires a valid hotspot at or above %.0f C",
+            NINEFAN_APPLE_HANDOFF_C);
+        return -1;
+    }
+    for (int index = 0; index < smc->fan_count; index++) {
+        const ninefan_fan *fan = &smc->fans[index];
+        if (!ninefan_hot_start_fan_eligible(
+                fan->valid, fan->mode, fan->target_rpm,
+                fan->actual_rpm, fan->maximum_rpm,
+                1.0f)) {
+            snprintf(message, message_size,
+                "Fan %d is not safely eligible for a hot-start maximum; "
+                "Apple control must remain active",
+                index);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int select_curve(
     const ninefan_curve *curve, ninefan_controller *controller, ninefan_watchdog *watchdog,
     ninefan_smc *smc, ninefan_lease *lease,
+    ninefan_hot_policy *hot_policy,
+    int *hot_start_requested,
     char *message, size_t message_size, int control_lock_fd) {
     if (geteuid() != 0) return -1;
+    if (hot_start_requested) *hot_start_requested = 0;
     if (!platform_policy_allows(smc, message, message_size)) return -1;
     const uint64_t remaining_ms = ninefan_lease_remaining_ms(
         lease, ninefan_continuous_time_ns());
@@ -858,6 +914,37 @@ static int select_curve(
             "System thermal state is %s; custom control is refused",
             ninefan_thermal_state_name(thermal_state));
         return -1;
+    }
+    if (refresh_snapshot(smc, controller, message, message_size) != 0) {
+        return -1;
+    }
+    (void)ninefan_hot_policy_observe(
+        hot_policy, controller->temperature_valid,
+        controller->current_temperature);
+    if (!ninefan_hot_policy_allows_manual(hot_policy)
+        && curve != ninefan_curve_named("max")) {
+        snprintf(message, message_size,
+            "Hot-temperature lockout is active; press 4 for one guarded "
+            "hot-start maximum, or wait until the hotspot falls to %.0f C",
+            NINEFAN_MANUAL_REARM_C);
+        return -1;
+    }
+    if (!ninefan_hot_policy_allows_manual(hot_policy)
+        && !ninefan_hot_policy_hot_start_available(hot_policy)) {
+        snprintf(message, message_size,
+            "The guarded hot-start maximum was already used during this "
+            "lockout; Apple control remains active until %.0f C",
+            NINEFAN_MANUAL_REARM_C);
+        return -1;
+    }
+    if (!ninefan_hot_policy_allows_manual(hot_policy)
+        && (hot_start_preflight(
+                smc, controller, message, message_size) != 0
+            || !hot_start_requested)) {
+        return -1;
+    }
+    if (!ninefan_hot_policy_allows_manual(hot_policy)) {
+        *hot_start_requested = 1;
     }
     if (smc->temperature_keys_saturated) {
         snprintf(message, message_size,
@@ -888,12 +975,34 @@ static int select_curve(
             message, message_size) != 0) {
         return -1;
     }
-    if (smc->temperature_keys_saturated
+    const ninefan_thermal_state rechecked_thermal_state =
+        ninefan_thermal_state_current();
+    if (!ninefan_thermal_state_allows_control(rechecked_thermal_state)
+        || refresh_snapshot(smc, controller, message, message_size) != 0
+        || smc->temperature_keys_saturated
         || !hardware_validation_matches(smc)
         || !platform_policy_allows(smc, message, message_size)) {
         snprintf(message, message_size,
-            "Platform, hardware, or temperature discovery changed during guard startup; "
-            "custom control is refused");
+            "Platform, hardware, thermal state, or telemetry changed during "
+            "guard startup; custom control is refused");
+        if (guard_started_here) watchdog_clean_stop(watchdog);
+        return -1;
+    }
+    (void)ninefan_hot_policy_observe(
+        hot_policy, controller->temperature_valid,
+        controller->current_temperature);
+    if ((hot_start_requested && *hot_start_requested
+            && (hot_start_preflight(
+                    smc, controller, message, message_size) != 0
+                || !ninefan_hot_policy_hot_start_available(hot_policy)))
+        || ((!hot_start_requested || !*hot_start_requested)
+            && !ninefan_hot_policy_allows_manual(hot_policy))) {
+        if (!hot_start_requested || !*hot_start_requested) {
+            snprintf(message, message_size,
+                "Hotspot crossed %.0f C during guard startup; "
+                "Apple control remains active",
+                NINEFAN_APPLE_HANDOFF_C);
+        }
         if (guard_started_here) watchdog_clean_stop(watchdog);
         return -1;
     }
@@ -953,6 +1062,9 @@ static int select_session_curve(
     ninefan_watchdog *watchdog,
     ninefan_smc *smc,
     ninefan_lease *lease,
+    ninefan_hot_policy *hot_policy,
+    int *hot_start_active,
+    uint64_t *hot_start_deadline_ns,
     char *message,
     size_t message_size,
     int control_lock_fd) {
@@ -963,7 +1075,10 @@ static int select_session_curve(
     }
     const int control_was_active =
         watchdog->active || controller->manual_active || controller->curve;
-    if (select_curve(curve, controller, watchdog, smc, lease,
+    int hot_start_requested = 0;
+    if (select_curve(
+            curve, controller, watchdog, smc, lease, hot_policy,
+            &hot_start_requested,
             message, message_size, control_lock_fd) != 0) {
         if (control_was_active) {
             (void)restore_session(
@@ -986,6 +1101,32 @@ static int select_session_curve(
             return -2;
         }
     }
+    if (hot_start_requested) {
+        const uint64_t now_ns = ninefan_continuous_time_ns();
+        const uint64_t duration_ns =
+            NINEFAN_HOT_START_CONTROL_MS * 1000000ULL;
+        if (!hot_start_active
+            || !hot_start_deadline_ns
+            || now_ns == 0
+            || now_ns > UINT64_MAX - duration_ns
+            || watchdog_limit_hot_start(watchdog) != 0
+            || !ninefan_hot_policy_consume_hot_start(hot_policy)) {
+            snprintf(message, message_size,
+                "Could not enforce the independent hot-start safety limit");
+            (void)restore_session(
+                smc, controller, response_monitor, watchdog,
+                message, message_size);
+            return -2;
+        }
+        *hot_start_active = 1;
+        *hot_start_deadline_ns = now_ns + duration_ns;
+        snprintf(message, message_size,
+            "Guarded hot-start maximum active for at most %llu seconds",
+            (unsigned long long)(NINEFAN_HOT_START_CONTROL_MS / 1000ULL));
+    } else if (hot_start_active && hot_start_deadline_ns) {
+        *hot_start_active = 0;
+        *hot_start_deadline_ns = 0;
+    }
     return 0;
 }
 
@@ -997,8 +1138,12 @@ static int run_session(
     ninefan_watchdog watchdog = {0};
     ninefan_controller controller;
     ninefan_response_monitor response_monitor;
+    ninefan_hot_policy hot_policy;
     ninefan_controller_init(&controller);
     ninefan_response_monitor_init(&response_monitor);
+    ninefan_hot_policy_init(&hot_policy);
+    int hot_start_active = 0;
+    uint64_t hot_start_deadline_ns = 0;
     char message[256] = {0};
     ninefan_lease lease;
     const uint64_t maximum_ms =
@@ -1015,7 +1160,9 @@ static int run_session(
     if (initial_command != NINEFAN_COMMAND_DEFAULT
         && select_session_curve(
                initial_command, &controller, &response_monitor,
-               &watchdog, smc, &lease, message, sizeof(message),
+               &watchdog, smc, &lease, &hot_policy,
+               &hot_start_active, &hot_start_deadline_ns,
+               message, sizeof(message),
                control_lock_fd) != 0) {
         (void)send_event(NINEFAN_EVENT_EXIT, 1, smc, &controller,
             &lease, message);
@@ -1027,6 +1174,24 @@ static int run_session(
     int channel_usable = 1;
 
     while (!termination_requested) {
+        if (hot_start_active) {
+            const uint64_t hot_now_ns = ninefan_continuous_time_ns();
+            if (hot_now_ns == 0
+                || hot_now_ns >= hot_start_deadline_ns) {
+                snprintf(message, sizeof(message),
+                    "Hot-start maximum completed; Apple control is active");
+                if (restore_session(
+                        smc, &controller, &response_monitor, &watchdog,
+                        message, sizeof(message)) != 0) {
+                    exit_code = 1;
+                    break;
+                }
+                hot_start_active = 0;
+                hot_start_deadline_ns = 0;
+                next_sample = 0;
+                continue;
+            }
+        }
         const ninefan_lease_result lease_result =
             ninefan_lease_check(
                 &lease, ninefan_continuous_time_ns(),
@@ -1049,14 +1214,18 @@ static int run_session(
                 ninefan_thermal_state_current();
             if (!ninefan_thermal_state_allows_control(thermal_state)) {
                 snprintf(message, sizeof(message),
-                    "System thermal state became %s; surrendering to Apple control",
+                    "System thermal state became %s; Apple control is active",
                     ninefan_thermal_state_name(thermal_state));
-                controller.curve = NULL;
-                (void)restore_session(
+                if (restore_session(
                     smc, &controller, &response_monitor, &watchdog,
-                    message, sizeof(message));
-                exit_code = 1;
-                break;
+                    message, sizeof(message)) != 0) {
+                    exit_code = 1;
+                    break;
+                }
+                hot_start_active = 0;
+                hot_start_deadline_ns = 0;
+                next_sample = 0;
+                continue;
             }
         }
         if (controller.curve
@@ -1073,6 +1242,11 @@ static int run_session(
         if (now >= next_sample) {
             const int snapshot_result =
                 refresh_snapshot(smc, &controller, message, sizeof(message));
+            const ninefan_hot_result hot_result =
+                ninefan_hot_policy_observe(
+                    &hot_policy,
+                    snapshot_result == 0 && controller.temperature_valid,
+                    controller.current_temperature);
             if (controller.curve) {
                 if (snapshot_result == 0
                     && verify_fan_response(
@@ -1083,16 +1257,7 @@ static int run_session(
                     exit_code = 1;
                     break;
                 }
-                const int emergency_temperature =
-                    controller.temperature_valid
-                    && controller.current_temperature
-                        >= APPLE_HANDOFF_TEMPERATURE_C;
-                if (snapshot_result != 0 || emergency_temperature) {
-                    if (emergency_temperature) {
-                        snprintf(message, sizeof(message),
-                            "Hotspot reached %.0f C; surrendering to Apple control",
-                            controller.current_temperature);
-                    }
+                if (snapshot_result != 0) {
                     controller.curve = NULL;
                     (void)restore_session(
                         smc, &controller, &response_monitor, &watchdog,
@@ -1100,8 +1265,45 @@ static int run_session(
                     exit_code = 1;
                     break;
                 }
+                if ((hot_result == NINEFAN_HOT_HANDOFF
+                        || hot_result == NINEFAN_HOT_HANDOFF_LOCKED)
+                    && !hot_start_active) {
+                    snprintf(message, sizeof(message),
+                        "Hotspot reached %.0f C; Apple emergency control is active. "
+                        "Press 4 for one guarded hot-start maximum; "
+                        "other curves unlock at %.0f C",
+                        controller.current_temperature,
+                        NINEFAN_MANUAL_REARM_C);
+                    if (restore_session(
+                            smc, &controller, &response_monitor, &watchdog,
+                            message, sizeof(message)) != 0) {
+                        exit_code = 1;
+                        break;
+                    }
+                    next_sample = 0;
+                    continue;
+                }
+                if (hot_start_active
+                    && hot_result == NINEFAN_HOT_REARMED) {
+                    snprintf(message, sizeof(message),
+                        "Hotspot cooled to %.0f C; hot-start maximum completed "
+                        "and Apple control is active",
+                        controller.current_temperature);
+                    if (restore_session(
+                            smc, &controller, &response_monitor, &watchdog,
+                            message, sizeof(message)) != 0) {
+                        exit_code = 1;
+                        break;
+                    }
+                    hot_start_active = 0;
+                    hot_start_deadline_ns = 0;
+                    next_sample = 0;
+                    continue;
+                }
                 const int update_result = update_controller(
                     smc, &controller, &response_monitor, &watchdog,
+                    hot_start_active
+                        || ninefan_hot_result_forces_maximum(hot_result),
                     message, sizeof(message));
                 if (update_result != 0) {
                     controller.curve = NULL;
@@ -1112,6 +1314,28 @@ static int run_session(
                     }
                     exit_code = 1;
                     break;
+                }
+                if (hot_start_active) {
+                    const uint64_t message_now_ns =
+                        ninefan_continuous_time_ns();
+                    const uint64_t remaining_ns =
+                        message_now_ns > 0
+                            && hot_start_deadline_ns > message_now_ns
+                        ? hot_start_deadline_ns
+                            - message_now_ns
+                        : 0;
+                    snprintf(message, sizeof(message),
+                        "Guarded hot-start maximum active; %llu seconds remain",
+                        (unsigned long long)(
+                            (remaining_ns + 999999999ULL) / 1000000000ULL));
+                } else if (hot_result == NINEFAN_HOT_MAXIMUM_STARTED) {
+                    snprintf(message, sizeof(message),
+                        "Hotspot reached %.0f C; pre-handoff maximum cooling active",
+                        controller.current_temperature);
+                } else if (hot_result == NINEFAN_HOT_MAXIMUM_ENDED) {
+                    snprintf(message, sizeof(message),
+                        "Hotspot eased to %.0f C; selected curve resumed",
+                        controller.current_temperature);
                 }
                 if (watchdog_heartbeat(&watchdog, 1) != 0) {
                     snprintf(message, sizeof(message),
@@ -1134,6 +1358,17 @@ static int run_session(
                     exit_code = 1;
                     break;
                 }
+            } else if (hot_result == NINEFAN_HOT_HANDOFF) {
+                snprintf(message, sizeof(message),
+                    "Hotspot reached %.0f C; Apple emergency control is active. "
+                    "Press 4 for one guarded hot-start maximum; "
+                    "other curves unlock at %.0f C",
+                    controller.current_temperature,
+                    NINEFAN_MANUAL_REARM_C);
+            } else if (hot_result == NINEFAN_HOT_REARMED) {
+                snprintf(message, sizeof(message),
+                    "Hotspot cooled to %.0f C; manual curves are available again",
+                    controller.current_temperature);
             }
             if (send_event(
                     NINEFAN_EVENT_SNAPSHOT, 0, smc, &controller,
@@ -1144,7 +1379,10 @@ static int run_session(
                 exit_code = 1;
                 break;
             }
-            next_sample = now + SAMPLE_INTERVAL_MS;
+            next_sample = now
+                + ninefan_hot_policy_sample_interval_ms(
+                    controller.temperature_valid,
+                    controller.current_temperature);
         }
 
         struct pollfd descriptor = {
@@ -1190,11 +1428,15 @@ static int run_session(
                     exit_code = 1;
                     break;
                 }
+                hot_start_active = 0;
+                hot_start_deadline_ns = 0;
                 next_sample = 0;
             } else {
                 const int selection_result = select_session_curve(
                     command.kind, &controller, &response_monitor,
-                    &watchdog, smc, &lease, message, sizeof(message),
+                    &watchdog, smc, &lease, &hot_policy,
+                    &hot_start_active, &hot_start_deadline_ns,
+                    message, sizeof(message),
                     control_lock_fd);
                 if (selection_result == -2
                     || (selection_result != 0 && !smc->is_open)) {
@@ -1360,7 +1602,7 @@ static int run_self_test(
             const ninefan_fan *fan = &smc->fans[index];
             const int accepted =
                 fan->mode == 1 && fabsf(fan->target_rpm - fan->maximum_rpm) <= 100.0f;
-            printf("Fan %d target: mode=%s, target=%.0f, maximum=%.0f — %s\n",
+            printf("Fan %d target: mode=%s, target=%.0f, maximum=%.0f: %s\n",
                 index, mode_name(fan->mode), fan->target_rpm, fan->maximum_rpm,
                 accepted ? "accepted" : "FAILED");
             if (!accepted) result = 1;
@@ -1413,7 +1655,7 @@ static int run_self_test(
         }
         if (termination_requested) result = 1;
         for (int index = 0; index < smc->fan_count; index++) {
-            printf("Fan %d response: actual=%.0f RPM — %s\n",
+            printf("Fan %d response: actual=%.0f RPM: %s\n",
                 index, smc->fans[index].actual_rpm,
                 fans_responded[index] ? "accepted" : "FAILED");
             if (!fans_responded[index]) result = 1;

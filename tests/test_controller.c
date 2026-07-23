@@ -27,6 +27,8 @@ int main(void) {
     controller.current_temperature = 67.0f;
     assert(ninefan_controller_compute(&controller) == 1);
     assert(near(controller.requested_fraction, 0.35f));
+    assert(ninefan_controller_force_maximum(&controller) == 1);
+    assert(near(controller.requested_fraction, 1.0f));
 
     controller.manual_active = 1;
     controller.current_temperature = 50.0f;
@@ -41,10 +43,12 @@ int main(void) {
     controller.temperature_valid = 0;
     assert(ninefan_controller_compute(&controller) == 0);
     assert(isnan(controller.requested_fraction));
+    assert(ninefan_controller_force_maximum(&controller) == 0);
     controller.temperature_valid = 1;
     controller.current_temperature = NAN;
     assert(ninefan_controller_compute(&controller) == 0);
     assert(isnan(controller.requested_fraction));
+    assert(ninefan_controller_force_maximum(&controller) == 0);
 
     controller.temperature_valid = 1;
     controller.requested_fraction = 0.0f;
@@ -58,6 +62,7 @@ int main(void) {
         &controller, 7800.0f, 2300.0f, 0.0f, 0.0f)));
     assert(isnan(ninefan_controller_target(
         &controller, 0.0f, 7800.0f, 0.0f, 0.0f)));
+    assert(ninefan_controller_force_maximum(NULL) == 0);
 
     ninefan_controller_reset_runtime(&controller);
     assert(!controller.manual_active);
