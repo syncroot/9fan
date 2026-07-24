@@ -1,6 +1,6 @@
 #ifndef NINEFAN_VERSION_H
 #define NINEFAN_VERSION_H
 
-#define NINEFAN_VERSION "1.5.1"
+#define NINEFAN_VERSION "1.5.3"
 
 #endif

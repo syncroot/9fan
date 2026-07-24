@@ -97,6 +97,26 @@ int main(int argc, char **argv) {
     assert(strstr(automatic, "Hotspot unavailable"));
     assert_line_widths(automatic, 59);
 
+    event.monitor_only = 1;
+    snprintf(event.message, sizeof(event.message),
+        "Safety lease ended; Apple control is active");
+    char monitor[NINEFAN_TUI_FRAME_SIZE];
+    assert(ninefan_tui_render(
+        monitor, sizeof(monitor), &event, 59, 0) > 0);
+    assert(strstr(monitor, "READ-ONLY MONITOR"));
+    assert(strstr(monitor, "[Q] Quit read-only monitor"));
+    assert(strstr(monitor,
+        "Select 1-4 to request a new authorized safety lease."));
+    assert(!strstr(monitor, "Lease 0:00"));
+    assert_line_widths(monitor, 59);
+
+    char narrow_monitor[NINEFAN_TUI_FRAME_SIZE];
+    assert(ninefan_tui_render(
+        narrow_monitor, sizeof(narrow_monitor), &event, 42, 0) > 0);
+    assert(strstr(narrow_monitor, "State    READ-ONLY MONITOR"));
+    assert(strstr(narrow_monitor, "[Q] Quit read-only monitor"));
+    assert_line_widths(narrow_monitor, 42);
+
     event = sample_event();
     char colored[NINEFAN_TUI_FRAME_SIZE];
     assert(ninefan_tui_render(

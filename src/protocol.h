@@ -8,7 +8,7 @@
 #include <signal.h>
 
 #define NINEFAN_PROTOCOL_MAGIC 0x3946414eu
-#define NINEFAN_PROTOCOL_VERSION 1u
+#define NINEFAN_PROTOCOL_VERSION 2u
 #define NINEFAN_PROTOCOL_MESSAGE_SIZE 192
 #define NINEFAN_PROTOCOL_IO_TIMEOUT_MS 2000
 #define NINEFAN_PROTOCOL_MAX_FRAME_SIZE 512
@@ -34,6 +34,15 @@ typedef enum {
     NINEFAN_EVENT_EXIT = 3,
 } ninefan_event_kind;
 
+typedef enum {
+    NINEFAN_EXIT_NONE = 0,
+    NINEFAN_EXIT_USER_QUIT = 1,
+    NINEFAN_EXIT_LEASE_EXPIRED = 2,
+    NINEFAN_EXIT_MONITOR_REQUESTED = 3,
+    NINEFAN_EXIT_ERROR = 4,
+    NINEFAN_EXIT_TERMINATED = 5,
+} ninefan_exit_reason;
+
 typedef struct {
     float actual_rpm;
     float target_rpm;
@@ -56,6 +65,9 @@ typedef struct {
     uint8_t fan_count;
     uint8_t selected_curve;
     uint8_t manual_active;
+    uint8_t exit_reason;
+    uint8_t monitor_only;
+    uint8_t reserved[2];
     char hottest_key[5];
     char thermal_state[16];
     char message[NINEFAN_PROTOCOL_MESSAGE_SIZE];
@@ -69,7 +81,7 @@ _Static_assert(
     sizeof(ninefan_protocol_fan) == 20,
     "The fixed fan telemetry wire format changed");
 _Static_assert(
-    sizeof(ninefan_event) == 404,
+    sizeof(ninefan_event) == 408,
     "The fixed event wire format changed");
 _Static_assert(
     sizeof(ninefan_event) <= NINEFAN_PROTOCOL_MAX_FRAME_SIZE,

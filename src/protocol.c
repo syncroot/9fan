@@ -20,8 +20,17 @@ int ninefan_protocol_event_valid(const ninefan_event *event) {
         && event->version == NINEFAN_PROTOCOL_VERSION
         && event->kind >= NINEFAN_EVENT_SNAPSHOT
         && event->kind <= NINEFAN_EVENT_EXIT
+        && (event->status == 0 || event->status == 1)
         && event->fan_count <= NINEFAN_MAX_FANS
-        && event->selected_curve <= NINEFAN_COMMAND_MAXIMUM;
+        && event->selected_curve <= NINEFAN_COMMAND_MAXIMUM
+        && event->exit_reason <= NINEFAN_EXIT_TERMINATED
+        && event->monitor_only <= 1
+        && event->reserved[0] == 0
+        && event->reserved[1] == 0
+        && (event->kind == NINEFAN_EVENT_EXIT
+            ? event->exit_reason != NINEFAN_EXIT_NONE
+                && event->monitor_only == 0
+            : event->exit_reason == NINEFAN_EXIT_NONE);
 }
 
 static long long monotonic_milliseconds(void) {

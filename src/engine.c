@@ -797,6 +797,7 @@ static void watchdog_trigger_restore(ninefan_watchdog *watchdog) {
 static int send_event(
     int kind,
     int status,
+    ninefan_exit_reason exit_reason,
     const ninefan_smc *smc,
     const ninefan_controller *controller,
     const ninefan_lease *lease,
@@ -806,6 +807,7 @@ static int send_event(
         .version = NINEFAN_PROTOCOL_VERSION,
         .kind = (uint16_t)kind,
         .status = status,
+        .exit_reason = (uint8_t)exit_reason,
         .hotspot_c = NAN,
         .requested_fraction = NAN,
     };
@@ -1153,8 +1155,9 @@ static int run_session(
     if (ninefan_lease_start(
             &lease, duration_ms, maximum_ms,
             ninefan_continuous_time_ns()) != 0) {
-        (void)send_event(NINEFAN_EVENT_EXIT, 1, smc, &controller,
-            NULL, "Invalid safety lease");
+        (void)send_event(
+            NINEFAN_EVENT_EXIT, 1, NINEFAN_EXIT_ERROR,
+            smc, &controller, NULL, "Invalid safety lease");
         return 1;
     }
     if (initial_command != NINEFAN_COMMAND_DEFAULT
@@ -1164,14 +1167,16 @@ static int run_session(
                &hot_start_active, &hot_start_deadline_ns,
                message, sizeof(message),
                control_lock_fd) != 0) {
-        (void)send_event(NINEFAN_EVENT_EXIT, 1, smc, &controller,
-            &lease, message);
+        (void)send_event(
+            NINEFAN_EVENT_EXIT, 1, NINEFAN_EXIT_ERROR,
+            smc, &controller, &lease, message);
         return 1;
     }
 
     long long next_sample = 0;
     int exit_code = 0;
     int channel_usable = 1;
+    ninefan_exit_reason exit_reason = NINEFAN_EXIT_ERROR;
 
     while (!termination_requested) {
         if (hot_start_active) {
@@ -1204,9 +1209,15 @@ static int run_session(
                         ? "Sleep or scheduling gap detected; restoring Apple control"
                         : "Safety lease became invalid; restoring Apple control");
             exit_code = lease_result == NINEFAN_LEASE_EXPIRED ? 0 : 1;
-            (void)restore_session(
-                smc, &controller, &response_monitor, &watchdog,
-                message, sizeof(message));
+            exit_reason = lease_result == NINEFAN_LEASE_EXPIRED
+                ? NINEFAN_EXIT_LEASE_EXPIRED
+                : NINEFAN_EXIT_ERROR;
+            if (restore_session(
+                    smc, &controller, &response_monitor, &watchdog,
+                    message, sizeof(message)) != 0) {
+                exit_code = 1;
+                exit_reason = NINEFAN_EXIT_ERROR;
+            }
             break;
         }
         if (controller.curve) {
@@ -1371,7 +1382,8 @@ static int run_session(
                     controller.current_temperature);
             }
             if (send_event(
-                    NINEFAN_EVENT_SNAPSHOT, 0, smc, &controller,
+                    NINEFAN_EVENT_SNAPSHOT, 0, NINEFAN_EXIT_NONE,
+                    smc, &controller,
                     &lease, message) != 0) {
                 snprintf(message, sizeof(message),
                     "Frontend disconnected; restoring Apple control");
@@ -1419,6 +1431,7 @@ static int run_session(
             if (command.kind == NINEFAN_COMMAND_QUIT) {
                 snprintf(message, sizeof(message),
                     "Session ended; Apple automatic control restored");
+                exit_reason = NINEFAN_EXIT_USER_QUIT;
                 break;
             }
             if (command.kind == NINEFAN_COMMAND_DEFAULT) {
@@ -1430,7 +1443,8 @@ static int run_session(
                 }
                 hot_start_active = 0;
                 hot_start_deadline_ns = 0;
-                next_sample = 0;
+                exit_reason = NINEFAN_EXIT_MONITOR_REQUESTED;
+                break;
             } else {
                 const int selection_result = select_session_curve(
                     command.kind, &controller, &response_monitor,
@@ -1460,15 +1474,18 @@ static int run_session(
                 smc, &controller, &response_monitor, &watchdog,
                 message, sizeof(message)) != 0) {
             exit_code = 1;
+            exit_reason = NINEFAN_EXIT_ERROR;
         }
     }
     if (termination_requested) {
         snprintf(message, sizeof(message),
             "Engine terminated; Apple control restored");
+        exit_reason = NINEFAN_EXIT_TERMINATED;
     }
     if (channel_usable) {
-        (void)send_event(NINEFAN_EVENT_EXIT, exit_code, smc,
-            &controller, &lease, message);
+        (void)send_event(
+            NINEFAN_EVENT_EXIT, exit_code, exit_reason,
+            smc, &controller, &lease, message);
     }
     return exit_code;
 }

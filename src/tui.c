@@ -148,12 +148,18 @@ static void append_status(tui_buffer *buffer, const ninefan_event *event) {
                 event->thermal_state);
         }
         append_line(buffer, NULL, line, 0);
-        format_text(line, sizeof(line),
-            " Profile  %-13s Lease %u:%02u  %s",
-            profile_name(event->selected_curve),
-            event->lease_remaining_seconds / 60,
-            event->lease_remaining_seconds % 60,
-            event->manual_active ? "MANUAL" : "APPLE AUTO");
+        if (event->monitor_only) {
+            format_text(line, sizeof(line),
+                " Profile  %-13s READ-ONLY MONITOR",
+                profile_name(event->selected_curve));
+        } else {
+            format_text(line, sizeof(line),
+                " Profile  %-13s Lease %u:%02u  %s",
+                profile_name(event->selected_curve),
+                event->lease_remaining_seconds / 60,
+                event->lease_remaining_seconds % 60,
+                event->manual_active ? "MANUAL" : "APPLE AUTO");
+        }
         append_line(buffer,
             event->manual_active ? ANSI_WARNING : ANSI_GOOD,
             line, 0);
@@ -174,11 +180,16 @@ static void append_status(tui_buffer *buffer, const ninefan_event *event) {
         append_line(buffer,
             event->manual_active ? ANSI_WARNING : ANSI_GOOD,
             line, 0);
-        format_text(line, sizeof(line),
-            " Lease    %u:%02u  %s",
-            event->lease_remaining_seconds / 60,
-            event->lease_remaining_seconds % 60,
-            event->manual_active ? "MANUAL" : "AUTO");
+        if (event->monitor_only) {
+            format_text(line, sizeof(line),
+                " State    READ-ONLY MONITOR");
+        } else {
+            format_text(line, sizeof(line),
+                " Lease    %u:%02u  %s",
+                event->lease_remaining_seconds / 60,
+                event->lease_remaining_seconds % 60,
+                event->manual_active ? "MANUAL" : "AUTO");
+        }
         append_line(buffer,
             event->manual_active ? ANSI_WARNING : ANSI_GOOD,
             line, 0);
@@ -271,9 +282,13 @@ static void append_profiles(
 static void append_footer(
     tui_buffer *buffer, const ninefan_event *event) {
     append_rule(buffer);
-    append_line(buffer, NULL,
-        " [Q] Restore Apple control and quit", 0);
-    if (buffer->columns >= TUI_COMPACT_COLUMNS) {
+    append_line(buffer, NULL, event->monitor_only
+        ? " [Q] Quit read-only monitor"
+        : " [Q] Restore Apple control and quit", 0);
+    if (event->monitor_only) {
+        append_line(buffer, ANSI_DIM,
+            " Select 1-4 to request a new authorized safety lease.", 0);
+    } else if (buffer->columns >= TUI_COMPACT_COLUMNS) {
         append_line(buffer, ANSI_DIM,
             " Session lease is fixed and cannot be extended.", 0);
     }

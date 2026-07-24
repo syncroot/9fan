@@ -69,8 +69,10 @@ Maximum shortens the remaining session to no more than 10 minutes, and
 self-test has a two-minute lease. A hot-start Maximum is additionally bounded
 to 15 seconds by the engine and 20 seconds by the independent guard. Both use a
 clock that includes sleep. Expiration or a sleep/scheduling gap restores Apple
-control. Restarting control requires fresh authorization and all
-preflight checks.
+control and ends the privileged engine. The normal-user frontend remains open
+as a read-only monitor after ordinary lease expiration. Restarting control
+creates a new sudo engine and requires fresh authorization and all preflight
+checks; the expired root process is never retained.
 
 ## Recovery
 

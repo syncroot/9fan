@@ -11,10 +11,10 @@ TEST_TARGETS := $(BUILD_DIR)/test-curve $(BUILD_DIR)/test-controller \
 	$(BUILD_DIR)/test-platform-policy $(BUILD_DIR)/test-lease \
 	$(BUILD_DIR)/test-protocol $(BUILD_DIR)/test-channel \
 	$(BUILD_DIR)/test-guard-protocol $(BUILD_DIR)/test-hot-policy \
-	$(BUILD_DIR)/test-tui
+	$(BUILD_DIR)/test-frontend-policy $(BUILD_DIR)/test-tui
 FRONTEND_SOURCES := src/main.c src/smc.c src/smc_codec.c src/curve.c \
 	src/protocol.c src/channel.c src/platform_policy.c src/signal_guard.c \
-	src/thermal_guard.m src/tui.c
+	src/thermal_guard.m src/hot_policy.c src/frontend_policy.c src/tui.c
 ENGINE_SOURCES := src/engine.c src/smc.c src/smc_codec.c src/curve.c src/controller.c \
 	src/response_monitor.c src/signal_guard.c src/thermal_guard.m src/hot_policy.c
 ENGINE_SOURCES += src/platform_policy.c src/lease.c src/protocol.c src/channel.c
@@ -22,7 +22,8 @@ GUARD_SOURCES := src/guard.c src/smc_codec.c src/lease.c src/guard_protocol.c
 HEADERS := src/smc.h src/smc_codec.h src/curve.h src/controller.h \
 	src/response_monitor.h src/signal_guard.h src/thermal_guard.h \
 	src/platform_policy.h src/lease.h src/protocol.h src/channel.h \
-	src/guard_protocol.h src/hot_policy.h src/tui.h src/version.h
+	src/guard_protocol.h src/hot_policy.h src/frontend_policy.h src/tui.h \
+	src/version.h
 BASE_CFLAGS := -std=c11 -Os -flto -Wall -Wextra -Wpedantic -Werror \
 	-fstack-protector-strong -D_FORTIFY_SOURCE=2
 ALL_CFLAGS := $(BASE_CFLAGS) $(CFLAGS)
@@ -108,6 +109,12 @@ $(BUILD_DIR)/test-hot-policy: tests/test_hot_policy.c src/hot_policy.c src/hot_p
 	@/bin/mkdir -p $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) tests/test_hot_policy.c src/hot_policy.c -o $@
 
+$(BUILD_DIR)/test-frontend-policy: tests/test_frontend_policy.c \
+		src/frontend_policy.c src/frontend_policy.h src/lease.h src/protocol.h
+	@/bin/mkdir -p $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) \
+		tests/test_frontend_policy.c src/frontend_policy.c -o $@
+
 $(BUILD_DIR)/test-tui: tests/test_tui.c src/tui.c src/tui.h src/curve.c src/curve.h src/protocol.c src/protocol.h
 	@/bin/mkdir -p $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) \
@@ -126,6 +133,7 @@ test: $(TEST_TARGETS) | check-unprivileged
 	$(BUILD_DIR)/test-channel
 	$(BUILD_DIR)/test-guard-protocol
 	$(BUILD_DIR)/test-hot-policy
+	$(BUILD_DIR)/test-frontend-policy
 	$(BUILD_DIR)/test-tui
 
 analyze: | check-unprivileged
@@ -147,6 +155,7 @@ analyze: | check-unprivileged
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/channel.c
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/guard_protocol.c
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/hot_policy.c
+	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/frontend_policy.c
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(BASE_CFLAGS) src/tui.c
 
 verify: check-unprivileged

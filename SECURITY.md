@@ -58,6 +58,10 @@ system logs.
   using a clock that includes time asleep. A sleep/scheduling gap restores
   Apple control, Maximum shortens the session to ten minutes, and a hot-start
   maximum has separate 15-second engine and 20-second guard limits.
+- Ordinary lease expiration restores Apple control and terminates the
+  privileged engine while the normal-user frontend continues as a read-only
+  monitor. A later profile selection creates a new sudo process, new private
+  channel, new guard, and new fixed lease.
 - Startup explicitly unblocks handled termination signals and checks every
   handler installation call; control is refused if installation fails.
 - Only one privileged controller or self-test may run at a time.

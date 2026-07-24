@@ -1,7 +1,7 @@
 # 9fan
 
 `9fan` is a small, dependency-free terminal fan controller for one explicitly
-verified Apple Silicon platform. Version 1.5.1 separates the normal-user
+verified Apple Silicon platform. Version 1.5.3 separates the normal-user
 terminal frontend from a minimal, on-demand root control engine. The only
 currently allowlisted profile is the locally tested Mac17,9 M5 Pro and macOS
 build documented below.
@@ -76,7 +76,8 @@ The app is conservative by design:
   remaining session to at most 10 minutes. Self-test is limited to two minutes.
   A hot-start Maximum controls for at most 15 seconds and its independent guard
   is limited to 20 seconds. Expiration or a sleep/scheduling gap restores Apple
-  control.
+  control and terminates the root engine. The normal-user terminal then remains
+  open as a read-only monitor.
 
 ## Curves
 
@@ -123,7 +124,7 @@ and returned to Apple automatic mode with a zero target after the test. The
 validated SMC schema fingerprint was `651d1eadd3e88f2a`.
 
 This result documents one hardware and OS combination; it is not an Apple
-endorsement or a guarantee for another Mac. Version 1.5.1 permits manual
+endorsement or a guarantee for another Mac. Version 1.5.3 permits manual
 control only when the complete observed identity matches this compiled profile:
 `Mac17,9`, `Apple M5 Pro`, `25F84`, two fans, `F%dmd`, and schema
 `651d1eadd3e88f2a`. It also requires that machine to pass the guarded self-test
@@ -186,12 +187,20 @@ the fixed control engine:
 The interactive display automatically adapts on each telemetry refresh. A
 terminal at least 48 columns wide shows the compact fan table and curve
 summaries; narrower windows use a reduced layout instead of wrapping rows.
+With no privileged control session active, the frontend is a normal-user
+read-only monitor and no root engine remains running. When a safety lease
+expires, 9fan restores Apple control, terminates the privileged engine, and
+returns to this monitor instead of closing the terminal. Selecting `1` through
+`4` starts a new sudo invocation, runs all preflight checks again, and creates a
+new bounded lease. The frontend retains its alternate terminal screen during
+this authorization handoff, so the monitor does not disappear and recreate
+itself when a profile is selected.
 
 Keys in the interactive screen:
 
 | Key | Action |
 | --- | --- |
-| `a` or `0` | Restore Apple automatic control |
+| `a` or `0` | Restore Apple automatic control; remain read-only when already monitoring |
 | `1` | Quiet |
 | `2` | Balanced |
 | `3` | Performance |

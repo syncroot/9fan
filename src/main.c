@@ -1,5 +1,7 @@
 #include "channel.h"
 #include "curve.h"
+#include "frontend_policy.h"
+#include "hot_policy.h"
 #include "platform_policy.h"
 #include "protocol.h"
 #include "signal_guard.h"
@@ -22,20 +24,38 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ENGINE_PATH "/usr/local/libexec/9fan-engine"
 #define ENGINE_AUTHORIZATION_TIMEOUT_STEPS 600
 #define ENGINE_AUTHORIZATION_POLL_MS 200
 #define ENGINE_SHUTDOWN_TIMEOUT_MS 2000
+#define MONITOR_INPUT_POLL_MS 200
 
 typedef struct {
     struct termios original;
     int active;
+    int raw;
 } ninefan_terminal;
+
+typedef struct {
+    int exit_code;
+    ninefan_exit_reason exit_reason;
+    char message[NINEFAN_PROTOCOL_MESSAGE_SIZE];
+} ninefan_session_result;
+
+typedef enum {
+    NINEFAN_MONITOR_QUIT = 0,
+    NINEFAN_MONITOR_START_CONTROL = 1,
+    NINEFAN_MONITOR_RESTORE_DEFAULT = 2,
+    NINEFAN_MONITOR_ERROR = -1,
+} ninefan_monitor_result;
 
 static volatile sig_atomic_t termination_requested;
 static ninefan_terminal *active_terminal;
+
+static int run_maintenance_engine(int self_test);
 
 static void terminal_restore(void) {
     if (!active_terminal || !active_terminal->active) return;
@@ -43,6 +63,7 @@ static void terminal_restore(void) {
     static const char sequence[] = "\033[?25h\033[?1049l";
     (void)write(STDOUT_FILENO, sequence, sizeof(sequence) - 1);
     active_terminal->active = 0;
+    active_terminal->raw = 0;
     active_terminal = NULL;
 }
 
@@ -66,9 +87,33 @@ static void terminal_enter(ninefan_terminal *terminal) {
     cfmakeraw(&raw);
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return;
     terminal->active = 1;
+    terminal->raw = 1;
     active_terminal = terminal;
     printf("\033[?1049h\033[?25l\033[2J");
     fflush(stdout);
+}
+
+static int terminal_suspend_input(ninefan_terminal *terminal) {
+    if (!terminal || !terminal->active || !terminal->raw) return -1;
+    if (tcsetattr(
+            STDIN_FILENO, TCSAFLUSH, &terminal->original) != 0) {
+        return -1;
+    }
+    static const char sequence[] = "\033[?25h";
+    (void)write(STDOUT_FILENO, sequence, sizeof(sequence) - 1);
+    terminal->raw = 0;
+    return 0;
+}
+
+static int terminal_resume_input(ninefan_terminal *terminal) {
+    if (!terminal || !terminal->active || terminal->raw) return -1;
+    struct termios raw = terminal->original;
+    cfmakeraw(&raw);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return -1;
+    static const char sequence[] = "\033[?25l";
+    (void)write(STDOUT_FILENO, sequence, sizeof(sequence) - 1);
+    terminal->raw = 1;
+    return 0;
 }
 
 static void terminal_leave(ninefan_terminal *terminal) {
@@ -305,46 +350,45 @@ static void render_event(const ninefan_event *event) {
     }
 }
 
-static int key_to_command(unsigned char key, ninefan_command *command) {
-    if (!command) return 0;
-    uint16_t kind;
-    if (key == 'a' || key == 'A' || key == '0') {
-        kind = NINEFAN_COMMAND_DEFAULT;
-    } else if (key >= '1' && key <= '4') {
-        kind = (uint16_t)(key - '0');
-    } else if (key == 'q' || key == 'Q' || key == 3) {
-        kind = NINEFAN_COMMAND_QUIT;
-    } else {
-        return 0;
-    }
-    *command = (ninefan_command) {
-        .magic = NINEFAN_PROTOCOL_MAGIC,
-        .version = NINEFAN_PROTOCOL_VERSION,
-        .kind = kind,
-    };
-    return 1;
-}
-
-static int run_engine_session(
+static ninefan_session_result run_engine_session(
     uint16_t initial_command,
-    uint64_t duration_ms) {
+    uint64_t duration_ms,
+    ninefan_terminal *terminal) {
+    ninefan_session_result session = {
+        .exit_code = 1,
+        .exit_reason = NINEFAN_EXIT_ERROR,
+    };
     char error[192] = {0};
     if (trusted_engine_path(error, sizeof(error)) != 0) {
-        fprintf(stderr, "9fan: %s\n", error);
-        return 1;
+        snprintf(session.message, sizeof(session.message), "%s", error);
+        return session;
     }
     ninefan_channel_listener listener = {
         .listener_fd = -1,
     };
     if (ninefan_channel_listener_open(&listener) != 0) {
-        fprintf(stderr, "9fan: could not create the private engine channel\n");
-        return 1;
+        snprintf(session.message, sizeof(session.message),
+            "Could not create the private engine channel");
+        return session;
+    }
+    const int terminal_was_active =
+        terminal && terminal->active;
+    if (terminal_was_active
+        && terminal_suspend_input(terminal) != 0) {
+        snprintf(session.message, sizeof(session.message),
+            "Could not prepare the terminal for authorization");
+        ninefan_channel_listener_cleanup(&listener);
+        return session;
     }
     const pid_t child = fork();
     if (child < 0) {
-        fprintf(stderr, "9fan: could not start engine: %s\n", strerror(errno));
+        snprintf(session.message, sizeof(session.message),
+            "Could not start the privileged engine: %s", strerror(errno));
         ninefan_channel_listener_cleanup(&listener);
-        return 1;
+        if (terminal_was_active) {
+            (void)terminal_resume_input(terminal);
+        }
+        return session;
     }
     if (child == 0) {
         const int null_input = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -392,17 +436,64 @@ static int run_engine_session(
                     child, &child_status, 1) == 1;
         }
         if (!termination_requested) {
-            fprintf(stderr,
-                "9fan: privileged engine did not establish a secure channel\n");
+            snprintf(session.message, sizeof(session.message),
+                "Privileged engine did not establish a secure channel");
+        } else {
+            session.exit_reason = NINEFAN_EXIT_TERMINATED;
+            snprintf(session.message, sizeof(session.message),
+                "Frontend terminated during authorization");
         }
-        return child_status_valid && WIFEXITED(child_status)
+        session.exit_code = child_status_valid && WIFEXITED(child_status)
             ? WEXITSTATUS(child_status)
             : 1;
+        if (terminal_was_active
+            && terminal_resume_input(terminal) != 0) {
+            session.exit_code = 1;
+            session.exit_reason = NINEFAN_EXIT_ERROR;
+            snprintf(session.message, sizeof(session.message),
+                "Could not restore interactive terminal input");
+        }
+        return session;
     }
 
-    ninefan_terminal terminal = {0};
-    terminal_enter(&terminal);
-    int exit_code = 1;
+    if (terminal) {
+        if (terminal_was_active) {
+            if (terminal_resume_input(terminal) != 0) {
+                ninefan_command quit = {
+                    .magic = NINEFAN_PROTOCOL_MAGIC,
+                    .version = NINEFAN_PROTOCOL_VERSION,
+                    .kind = NINEFAN_COMMAND_QUIT,
+                };
+                (void)ninefan_protocol_write_full(
+                    channel_fd, &quit, sizeof(quit),
+                    NINEFAN_PROTOCOL_IO_TIMEOUT_MS, NULL);
+                close(channel_fd);
+                int status = 0;
+                (void)reap_child_with_escalation(child, &status, 1);
+                snprintf(session.message, sizeof(session.message),
+                    "Could not restore interactive terminal input");
+                return session;
+            }
+        } else {
+            terminal_enter(terminal);
+            if (!terminal->active) {
+                ninefan_command quit = {
+                    .magic = NINEFAN_PROTOCOL_MAGIC,
+                    .version = NINEFAN_PROTOCOL_VERSION,
+                    .kind = NINEFAN_COMMAND_QUIT,
+                };
+                (void)ninefan_protocol_write_full(
+                    channel_fd, &quit, sizeof(quit),
+                    NINEFAN_PROTOCOL_IO_TIMEOUT_MS, NULL);
+                close(channel_fd);
+                int status = 0;
+                (void)reap_child_with_escalation(child, &status, 1);
+                snprintf(session.message, sizeof(session.message),
+                    "Could not enter interactive terminal mode");
+                return session;
+            }
+        }
+    }
     int engine_done = 0;
     int suppress_terminal_input = 0;
     char final_message[NINEFAN_PROTOCOL_MESSAGE_SIZE] = {0};
@@ -413,7 +504,10 @@ static int run_engine_session(
         struct pollfd descriptors[2] = {
             {.fd = channel_fd, .events = POLLIN | POLLHUP, .revents = 0},
             {.fd = STDIN_FILENO,
-             .events = terminal.active ? POLLIN : 0, .revents = 0},
+             .events = terminal && terminal->active && terminal->raw
+                ? POLLIN
+                : 0,
+             .revents = 0},
         };
         int poll_result;
         do {
@@ -430,7 +524,9 @@ static int run_engine_session(
                 break;
             }
             if (event.kind == NINEFAN_EVENT_SNAPSHOT) {
-                if (terminal.active) render_event(&event);
+                if (terminal && terminal->active && terminal->raw) {
+                    render_event(&event);
+                }
                 else print_event_line(&event);
             } else {
                 ninefan_protocol_sanitize_text(
@@ -438,7 +534,9 @@ static int run_engine_session(
                 if (event.kind == NINEFAN_EVENT_EXIT) {
                     snprintf(final_message, sizeof(final_message), "%s",
                         event.message);
-                    exit_code = event.status;
+                    session.exit_code = event.status;
+                    session.exit_reason =
+                        (ninefan_exit_reason)event.exit_reason;
                     engine_done = 1;
                 } else if (event.message[0]) {
                     FILE *stream = event.status == 0 ? stdout : stderr;
@@ -446,13 +544,14 @@ static int run_engine_session(
                 }
             }
         }
-        if (terminal.active && (descriptors[1].revents & POLLIN)) {
+        if (terminal && terminal->active && terminal->raw
+            && (descriptors[1].revents & POLLIN)) {
             unsigned char input[64] = {0};
             const ssize_t input_size =
                 read(STDIN_FILENO, input, sizeof(input));
             if (input_size == 1 && input[0] != 27) {
                 ninefan_command command;
-                if (key_to_command(input[0], &command)
+                if (ninefan_frontend_command_for_key(input[0], &command)
                     && ninefan_protocol_write_full(
                            channel_fd, &command, sizeof(command),
                            NINEFAN_PROTOCOL_IO_TIMEOUT_MS,
@@ -476,23 +575,341 @@ static int run_engine_session(
             NINEFAN_PROTOCOL_IO_TIMEOUT_MS, NULL);
     }
     close(channel_fd);
-    terminal_leave(&terminal);
     int status = 0;
     const int child_wait_result =
         reap_child_with_escalation(child, &status, !engine_done);
     if (!engine_done) {
         if (child_wait_result == 1 && WIFEXITED(status)) {
-            exit_code = WEXITSTATUS(status);
+            session.exit_code = WEXITSTATUS(status);
         }
-        else exit_code = 1;
-    } else if (child_wait_result != 1) {
-        exit_code = 1;
+        else session.exit_code = 1;
+        session.exit_reason = termination_requested
+            ? NINEFAN_EXIT_TERMINATED
+            : NINEFAN_EXIT_ERROR;
+        if (!final_message[0]) {
+            snprintf(final_message, sizeof(final_message), "%s",
+                termination_requested
+                    ? "Frontend terminated; Apple control recovery requested"
+                    : "Privileged engine channel closed; "
+                      "Apple control recovery requested");
+        }
+    } else if (child_wait_result != 1
+        || !WIFEXITED(status)
+        || WEXITSTATUS(status) != session.exit_code) {
+        session.exit_code = 1;
+        session.exit_reason = NINEFAN_EXIT_ERROR;
+        snprintf(final_message, sizeof(final_message),
+            "Privileged engine exit did not match its final event; "
+            "Apple control recovery requested");
     }
     if (final_message[0]) {
-        FILE *stream = exit_code == 0 ? stdout : stderr;
-        fprintf(stream, "9fan: %s\n", final_message);
+        snprintf(session.message, sizeof(session.message), "%s",
+            final_message);
     }
-    return exit_code;
+    return session;
+}
+
+static long long frontend_monotonic_milliseconds(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    if (now.tv_sec > LLONG_MAX / 1000LL) return LLONG_MAX;
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+}
+
+static void initialize_monitor_event(
+    ninefan_event *event,
+    const char *message) {
+    if (!event) return;
+    *event = (ninefan_event) {
+        .magic = NINEFAN_PROTOCOL_MAGIC,
+        .version = NINEFAN_PROTOCOL_VERSION,
+        .kind = NINEFAN_EVENT_SNAPSHOT,
+        .hotspot_c = NAN,
+        .requested_fraction = NAN,
+        .selected_curve = NINEFAN_COMMAND_DEFAULT,
+        .monitor_only = 1,
+    };
+    const ninefan_thermal_state thermal_state =
+        ninefan_thermal_state_current();
+    snprintf(event->thermal_state, sizeof(event->thermal_state), "%s",
+        ninefan_thermal_state_name(thermal_state));
+    if (message) {
+        snprintf(event->message, sizeof(event->message), "%s", message);
+    }
+}
+
+static int refresh_monitor_event(
+    ninefan_smc *smc,
+    ninefan_event *event,
+    const char *message) {
+    if (!smc || !event) return -1;
+    initialize_monitor_event(event, message);
+    if (!smc->is_open && ninefan_smc_open(smc) != 0) {
+        event->status = 1;
+        snprintf(event->message, sizeof(event->message),
+            "Read-only telemetry unavailable: %s",
+            ninefan_smc_error(smc));
+        return -1;
+    }
+    if (ninefan_smc_refresh_fans(smc) != 0) {
+        event->status = 1;
+        snprintf(event->message, sizeof(event->message),
+            "Read-only fan telemetry failed: %s",
+            ninefan_smc_error(smc));
+        ninefan_smc_close(smc);
+        return -1;
+    }
+
+    event->fan_count = (uint8_t)smc->fan_count;
+    for (int index = 0;
+         index < smc->fan_count && index < NINEFAN_MAX_FANS;
+         index++) {
+        const ninefan_fan *fan = &smc->fans[index];
+        event->fans[index] = (ninefan_protocol_fan) {
+            .actual_rpm = fan->actual_rpm,
+            .target_rpm = fan->target_rpm,
+            .minimum_rpm = fan->minimum_rpm,
+            .maximum_rpm = fan->maximum_rpm,
+            .mode = fan->mode,
+            .valid = (uint8_t)(fan->valid != 0),
+        };
+        if (fan->mode == 1) event->manual_active = 1;
+    }
+
+    float hotspot = NAN;
+    char hottest_key[5] = "----";
+    if (ninefan_smc_hottest_temperature(
+            smc, &hotspot, hottest_key) == 0
+        && isfinite(hotspot)) {
+        event->hotspot_c = hotspot;
+        event->temperature_valid = 1;
+        memcpy(event->hottest_key, hottest_key, 5);
+    } else {
+        event->status = 1;
+        snprintf(event->message, sizeof(event->message),
+            "Read-only temperature telemetry failed: %s",
+            ninefan_smc_error(smc));
+    }
+    if (event->manual_active) {
+        event->status = 1;
+        snprintf(event->message, sizeof(event->message),
+            "Read-only monitor detected manual fan mode outside this session");
+    }
+    return event->status == 0 ? 0 : -1;
+}
+
+static ninefan_monitor_result run_read_only_monitor(
+    ninefan_terminal *terminal,
+    const char *initial_message,
+    uint16_t *selected_command) {
+    if (!terminal || !terminal->active || !terminal->raw
+        || !selected_command) {
+        return NINEFAN_MONITOR_ERROR;
+    }
+    *selected_command = NINEFAN_COMMAND_DEFAULT;
+
+    ninefan_smc smc = {0};
+    ninefan_event event = {0};
+    char message[NINEFAN_PROTOCOL_MESSAGE_SIZE] = {0};
+    snprintf(message, sizeof(message), "%s",
+        initial_message && initial_message[0]
+            ? initial_message
+            : "Read-only monitor active; select 1-4 to authorize control");
+    long long next_sample_ms = 0;
+    int suppress_terminal_input = 0;
+    ninefan_monitor_result result = NINEFAN_MONITOR_QUIT;
+
+    while (!termination_requested) {
+        if (suppress_terminal_input) {
+            suppress_terminal_input = !discard_terminal_burst();
+        }
+        const long long now_ms = frontend_monotonic_milliseconds();
+        if (now_ms < 0) {
+            result = NINEFAN_MONITOR_ERROR;
+            break;
+        }
+        if (now_ms >= next_sample_ms) {
+            (void)refresh_monitor_event(&smc, &event, message);
+            render_event(&event);
+            next_sample_ms = now_ms
+                + ninefan_hot_policy_sample_interval_ms(
+                    event.temperature_valid, event.hotspot_c);
+        }
+
+        struct pollfd descriptor = {
+            .fd = STDIN_FILENO,
+            .events = POLLIN | POLLHUP,
+            .revents = 0,
+        };
+        int poll_result;
+        do {
+            poll_result = poll(
+                &descriptor, 1, MONITOR_INPUT_POLL_MS);
+        } while (poll_result < 0 && errno == EINTR
+            && !termination_requested);
+        if (poll_result < 0) {
+            result = termination_requested
+                ? NINEFAN_MONITOR_QUIT
+                : NINEFAN_MONITOR_ERROR;
+            break;
+        }
+        if (poll_result > 0 && (descriptor.revents & POLLIN)) {
+            unsigned char input[64] = {0};
+            const ssize_t input_size =
+                read(STDIN_FILENO, input, sizeof(input));
+            if (input_size == 1 && input[0] != 27) {
+                ninefan_command command;
+                if (ninefan_frontend_command_for_key(
+                        input[0], &command)) {
+                    if (command.kind == NINEFAN_COMMAND_QUIT) {
+                        result = NINEFAN_MONITOR_QUIT;
+                        break;
+                    }
+                    if (command.kind == NINEFAN_COMMAND_DEFAULT) {
+                        event.status = 0;
+                        snprintf(event.message, sizeof(event.message),
+                            "Authorizing Apple restore; "
+                            "sudo may request your password");
+                        render_event(&event);
+                        result = NINEFAN_MONITOR_RESTORE_DEFAULT;
+                        break;
+                    } else {
+                        event.status = 0;
+                        snprintf(event.message, sizeof(event.message),
+                            "Authorizing %s; "
+                            "sudo may request your password",
+                            ninefan_curves[command.kind - 1].name);
+                        render_event(&event);
+                        *selected_command = command.kind;
+                        result = NINEFAN_MONITOR_START_CONTROL;
+                        break;
+                    }
+                }
+            } else if (input_size > 0) {
+                suppress_terminal_input = !discard_terminal_burst();
+            }
+        }
+        if (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            result = NINEFAN_MONITOR_ERROR;
+            break;
+        }
+    }
+
+    ninefan_smc_close(&smc);
+    return result;
+}
+
+static int run_interactive_maintenance_engine(
+    ninefan_terminal *terminal) {
+    if (terminal_suspend_input(terminal) != 0) return 1;
+    const int result = run_maintenance_engine(0);
+    if (terminal_resume_input(terminal) != 0) return 1;
+    return result;
+}
+
+static int report_session_result(
+    const ninefan_session_result *session) {
+    if (!session) return 1;
+    if (session->message[0]) {
+        FILE *stream = session->exit_code == 0 ? stdout : stderr;
+        fprintf(stream, "9fan: %s\n", session->message);
+    }
+    return session->exit_code;
+}
+
+static int run_interactive_frontend(
+    uint16_t initial_command,
+    uint64_t initial_duration_ms,
+    int start_with_control) {
+    uint16_t pending_command = initial_command;
+    uint64_t pending_duration_ms = initial_duration_ms;
+    char monitor_message[NINEFAN_PROTOCOL_MESSAGE_SIZE] = {0};
+    int should_start = start_with_control;
+    ninefan_terminal terminal = {0};
+    ninefan_session_result final_session = {0};
+    int report_final_session = 0;
+    int result = 0;
+
+    if (!start_with_control) {
+        terminal_enter(&terminal);
+        if (!terminal.active) {
+            fprintf(stderr,
+                "9fan: could not enter interactive terminal mode\n");
+            return 1;
+        }
+    }
+
+    for (;;) {
+        if (should_start) {
+            const ninefan_session_result session =
+                run_engine_session(
+                    pending_command, pending_duration_ms, &terminal);
+            if (session.exit_reason == NINEFAN_EXIT_USER_QUIT
+                || session.exit_reason == NINEFAN_EXIT_TERMINATED
+                || termination_requested) {
+                final_session = session;
+                report_final_session = 1;
+                result = session.exit_code;
+                break;
+            }
+            if (!ninefan_frontend_returns_to_monitor(
+                    session.exit_reason)) {
+                final_session = session;
+                report_final_session = 1;
+                result = session.exit_code;
+                break;
+            }
+            snprintf(monitor_message, sizeof(monitor_message), "%s",
+                session.exit_reason == NINEFAN_EXIT_LEASE_EXPIRED
+                    ? "Safety lease ended; Apple control is active. "
+                      "Select 1-4 for fresh authorization"
+                    : session.message[0]
+                        ? session.message
+                        : "Control engine ended; read-only monitor is active");
+        } else if (!monitor_message[0]) {
+            snprintf(monitor_message, sizeof(monitor_message),
+                "Read-only monitor active; select 1-4 to authorize control");
+        }
+
+        if (!terminal.active) {
+            terminal_enter(&terminal);
+            if (!terminal.active) {
+                result = 1;
+                break;
+            }
+        }
+        const ninefan_monitor_result monitor_result =
+            run_read_only_monitor(
+                &terminal, monitor_message, &pending_command);
+        if (monitor_result == NINEFAN_MONITOR_QUIT) {
+            result = 0;
+            break;
+        }
+        if (monitor_result == NINEFAN_MONITOR_RESTORE_DEFAULT) {
+            const int restore_result =
+                run_interactive_maintenance_engine(&terminal);
+            snprintf(monitor_message, sizeof(monitor_message), "%s",
+                restore_result == 0
+                    ? "Apple automatic control restored; "
+                      "read-only monitor is active"
+                    : "Apple automatic restore failed; "
+                      "read-only monitor is active");
+            should_start = 0;
+            continue;
+        }
+        if (monitor_result != NINEFAN_MONITOR_START_CONTROL) {
+            result = 1;
+            break;
+        }
+        pending_duration_ms =
+            ninefan_frontend_default_lease_ms(pending_command);
+        should_start = 1;
+    }
+    terminal_leave(&terminal);
+    if (report_final_session) {
+        return report_session_result(&final_session);
+    }
+    return result;
 }
 
 static int confirm_self_test(void) {
@@ -638,5 +1055,12 @@ int main(int argc, char **argv) {
         print_usage(stderr);
         return 2;
     }
-    return run_engine_session(initial, duration_ms);
+    if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+        return run_interactive_frontend(
+            initial, duration_ms,
+            initial != NINEFAN_COMMAND_DEFAULT);
+    }
+    const ninefan_session_result session =
+        run_engine_session(initial, duration_ms, NULL);
+    return report_session_result(&session);
 }
